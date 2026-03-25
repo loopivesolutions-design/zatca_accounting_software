@@ -1,0 +1,50 @@
+from django.urls import path
+
+from .views import (
+    CustomerChoicesAPI,
+    CustomerListCreateAPI,
+    CustomerDetailAPI,
+    QuoteListCreateAPI,
+    QuoteDetailAPI,
+    QuoteSendAPI,
+    QuoteChoicesAPI,
+    InvoiceListCreateAPI,
+    InvoiceDetailAPI,
+    InvoicePostAPI,
+    InvoiceChoicesAPI,
+    CustomerPaymentListCreateAPI,
+    CustomerPaymentDetailAPI,
+    CustomerOutstandingInvoicesAPI,
+    CustomerRefundListCreateAPI,
+    CustomerRefundDetailAPI,
+    CustomerOutstandingCreditNotesAPI,
+    CustomerCreditNoteListCreateAPI,
+    CustomerCreditNoteDetailAPI,
+    CustomerCreditNotePostAPI,
+)
+
+app_name = "sales"
+
+urlpatterns = [
+    path("customers/choices/", CustomerChoicesAPI.as_view(), name="customer-choices"),
+    path("customers/", CustomerListCreateAPI.as_view(), name="customer-list-create"),
+    path("customers/<uuid:pk>/", CustomerDetailAPI.as_view(), name="customer-detail"),
+    path("quotes/choices/", QuoteChoicesAPI.as_view(), name="quote-choices"),
+    path("quotes/", QuoteListCreateAPI.as_view(), name="quote-list-create"),
+    path("quotes/<uuid:pk>/", QuoteDetailAPI.as_view(), name="quote-detail"),
+    path("quotes/<uuid:pk>/send/", QuoteSendAPI.as_view(), name="quote-send"),
+    path("invoices/choices/", InvoiceChoicesAPI.as_view(), name="invoice-choices"),
+    path("invoices/", InvoiceListCreateAPI.as_view(), name="invoice-list-create"),
+    path("invoices/<uuid:pk>/", InvoiceDetailAPI.as_view(), name="invoice-detail"),
+    path("invoices/<uuid:pk>/post/", InvoicePostAPI.as_view(), name="invoice-post"),
+    path("customer-payments/", CustomerPaymentListCreateAPI.as_view(), name="customer-payment-list-create"),
+    path("customer-payments/<uuid:pk>/", CustomerPaymentDetailAPI.as_view(), name="customer-payment-detail"),
+    path("customer-payments/outstanding-invoices/", CustomerOutstandingInvoicesAPI.as_view(), name="customer-outstanding-invoices"),
+    path("customer-refunds/", CustomerRefundListCreateAPI.as_view(), name="customer-refund-list-create"),
+    path("customer-refunds/<uuid:pk>/", CustomerRefundDetailAPI.as_view(), name="customer-refund-detail"),
+    path("customer-refunds/outstanding-credit-notes/", CustomerOutstandingCreditNotesAPI.as_view(), name="customer-outstanding-credit-notes"),
+    path("credit-notes/", CustomerCreditNoteListCreateAPI.as_view(), name="customer-credit-note-list-create"),
+    path("credit-notes/<uuid:pk>/", CustomerCreditNoteDetailAPI.as_view(), name="customer-credit-note-detail"),
+    path("credit-notes/<uuid:pk>/post/", CustomerCreditNotePostAPI.as_view(), name="customer-credit-note-post"),
+]
+

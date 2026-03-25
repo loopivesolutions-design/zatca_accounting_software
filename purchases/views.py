@@ -1,0 +1,634 @@
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from django.db.models import Q
+from django.db import transaction
+from rest_framework.pagination import PageNumberPagination
+from decimal import Decimal
+
+from accounting.models import JournalEntry, JournalEntryLine, Account
+from .models import (
+    Supplier,
+    PAYMENT_TERMS_CHOICES,
+    VAT_TREATMENT_CHOICES,
+    OPENING_BALANCE_CHOICES,
+    Bill,
+    SupplierPayment,
+    SupplierPaymentAllocation,
+    SUPPLIER_PAYMENT_TYPE_CHOICES,
+    DebitNote,
+)
+from .serializers import (
+    SupplierSerializer,
+    BillSerializer,
+    BillPostSerializer,
+    BillListSerializer,
+    SupplierPaymentSerializer,
+    DebitNoteSerializer,
+)
+
+
+class SupplierPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+def _get_supplier(pk):
+    try:
+        return Supplier.objects.get(pk=pk, is_deleted=False)
+    except Supplier.DoesNotExist:
+        return None
+
+
+class SupplierListCreateAPI(APIView):
+    """
+    GET  /purchases/suppliers/
+    POST /purchases/suppliers/
+    """
+
+    permission_classes = [IsAuthenticated]
+    pagination_class = SupplierPagination
+
+    def get(self, request):
+        qs = Supplier.objects.filter(is_deleted=False).select_related("country", "opening_balance_account")
+
+        search = request.query_params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(company_name__icontains=search)
+                | Q(company_name_ar__icontains=search)
+                | Q(primary_contact_name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(phone__icontains=search)
+                | Q(tax_registration_number__icontains=search)
+            )
+
+        active_param = request.query_params.get("active")
+        if active_param is not None:
+            qs = qs.filter(is_active=active_param.lower() == "true")
+
+        vat_treatment = request.query_params.get("vat_treatment")
+        if vat_treatment:
+            qs = qs.filter(vat_treatment=vat_treatment)
+
+        country = request.query_params.get("country")
+        if country:
+            qs = qs.filter(country_id=country)
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs.order_by("-created_at"), request)
+        return paginator.get_paginated_response(SupplierSerializer(page, many=True).data)
+
+    def post(self, request):
+        serializer = SupplierSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        supplier = serializer.save(creator=request.user)
+        return Response(SupplierSerializer(supplier).data, status=status.HTTP_201_CREATED)
+
+
+class SupplierDetailAPI(APIView):
+    """
+    GET/PATCH/DELETE /purchases/suppliers/<uuid>/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        supplier = _get_supplier(pk)
+        if not supplier:
+            return Response({"error": "NOT_FOUND", "message": "Supplier not found."}, status=404)
+        return Response(SupplierSerializer(supplier).data)
+
+    def patch(self, request, pk):
+        supplier = _get_supplier(pk)
+        if not supplier:
+            return Response({"error": "NOT_FOUND", "message": "Supplier not found."}, status=404)
+        serializer = SupplierSerializer(supplier, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        supplier = serializer.save(updator=request.user)
+        return Response(SupplierSerializer(supplier).data)
+
+    def delete(self, request, pk):
+        supplier = _get_supplier(pk)
+        if not supplier:
+            return Response({"error": "NOT_FOUND", "message": "Supplier not found."}, status=404)
+
+        # Future: block delete if used in bills/payments. For now allow soft delete.
+        supplier.is_deleted = True
+        supplier.save(update_fields=["is_deleted", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SupplierChoicesAPI(APIView):
+    """
+    GET /purchases/suppliers/choices/
+    Returns dropdown choices for the Add Supplier form.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(
+            {
+                "payment_terms": [{"id": k, "label": v} for k, v in PAYMENT_TERMS_CHOICES],
+                "vat_treatments": [{"id": k, "label": v} for k, v in VAT_TREATMENT_CHOICES],
+                "opening_balance_types": [{"id": k, "label": v} for k, v in OPENING_BALANCE_CHOICES],
+            }
+        )
+
+
+class BillPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+def _get_bill(pk):
+    try:
+        return Bill.objects.get(pk=pk, is_deleted=False)
+    except Bill.DoesNotExist:
+        return None
+
+
+class BillListCreateAPI(APIView):
+    """
+    GET  /purchases/bills/
+    POST /purchases/bills/
+    """
+
+    permission_classes = [IsAuthenticated]
+    pagination_class = BillPagination
+
+    def get(self, request):
+        qs = Bill.objects.filter(is_deleted=False).select_related("supplier")
+
+        search = request.query_params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(bill_number__icontains=search)
+                | Q(note__icontains=search)
+                | Q(supplier__company_name__icontains=search)
+            )
+
+        status_param = request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        supplier = request.query_params.get("supplier")
+        if supplier:
+            qs = qs.filter(supplier_id=supplier)
+
+        date_from = request.query_params.get("date_from")
+        if date_from:
+            qs = qs.filter(bill_date__gte=date_from)
+
+        date_to = request.query_params.get("date_to")
+        if date_to:
+            qs = qs.filter(bill_date__lte=date_to)
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs.order_by("-bill_date", "-created_at"), request)
+        return paginator.get_paginated_response(BillListSerializer(page, many=True).data)
+
+    def post(self, request):
+        serializer = BillSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        bill = serializer.save()
+        return Response(BillSerializer(bill).data, status=status.HTTP_201_CREATED)
+
+
+class BillDetailAPI(APIView):
+    """
+    GET/PATCH/DELETE /purchases/bills/<uuid>/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        bill = _get_bill(pk)
+        if not bill:
+            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
+        return Response(BillSerializer(bill).data)
+
+    def patch(self, request, pk):
+        bill = _get_bill(pk)
+        if not bill:
+            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
+        serializer = BillSerializer(bill, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        bill = serializer.save()
+        return Response(BillSerializer(bill).data)
+
+    def delete(self, request, pk):
+        bill = _get_bill(pk)
+        if not bill:
+            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
+        if bill.status == "posted":
+            return Response(
+                {"error": "BILL_POSTED", "message": "Posted bill cannot be deleted."},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        bill.is_deleted = True
+        bill.save(update_fields=["is_deleted", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class BillPostAPI(APIView):
+    """
+    POST /purchases/bills/<uuid>/post/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        bill = _get_bill(pk)
+        if not bill:
+            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
+
+        serializer = BillPostSerializer(data=request.data, context={"bill": bill})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            try:
+                if data.get("create_journal_entry", False):
+                    self._create_and_post_journal_entry(
+                        bill=bill,
+                        user=request.user,
+                        payable_account_id=data.get("payable_account"),
+                        vat_account_id=data.get("vat_account"),
+                        posting_date=data.get("posting_date"),
+                        memo=data.get("memo", ""),
+                    )
+            except ValueError as exc:
+                return Response(
+                    {"error": "POST_VALIDATION_ERROR", "message": str(exc)},
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+
+            bill.mark_posted(user=request.user)
+
+        return Response(BillSerializer(bill).data, status=status.HTTP_200_OK)
+
+    def _create_and_post_journal_entry(
+        self,
+        *,
+        bill: Bill,
+        user,
+        payable_account_id=None,
+        vat_account_id=None,
+        posting_date=None,
+        memo="",
+    ) -> None:
+        payable_account = None
+        if payable_account_id:
+            payable_account = Account.objects.filter(pk=payable_account_id, is_deleted=False).first()
+            if not payable_account:
+                raise ValueError("Invalid payable_account provided.")
+        else:
+            payable_account = Account.objects.filter(code="211", is_deleted=False).first()
+            if not payable_account:
+                raise ValueError("Default Accounts Payable account (code 211) not found.")
+
+        if vat_account_id:
+            vat_account = Account.objects.filter(pk=vat_account_id, is_deleted=False).first()
+            if not vat_account:
+                raise ValueError("Invalid vat_account provided.")
+        else:
+            vat_account = Account.objects.filter(code="116", is_deleted=False).first()
+
+        je = JournalEntry.objects.create(
+            date=posting_date or bill.bill_date,
+            description=memo or f"Purchase Bill {bill.bill_number}",
+            status="draft",
+            creator=user,
+        )
+
+        order = 0
+        tax_total = 0
+        for line in bill.lines.filter(is_deleted=False).select_related("account", "tax_rate"):
+            base_amount = line.subtotal()
+            if base_amount > 0:
+                JournalEntryLine.objects.create(
+                    journal_entry=je,
+                    account=line.account,
+                    description=f"Bill {bill.bill_number} - {line.description}",
+                    debit=base_amount,
+                    credit=0,
+                    line_order=order,
+                    creator=user,
+                )
+                order += 1
+
+            line_tax = line.tax_amount()
+            tax_total += line_tax
+
+        if tax_total > 0:
+            if not vat_account:
+                raise ValueError("VAT Receivable account (code 116) required for taxable bill lines.")
+            JournalEntryLine.objects.create(
+                journal_entry=je,
+                account=vat_account,
+                description=f"VAT on Bill {bill.bill_number}",
+                debit=tax_total,
+                credit=0,
+                line_order=order,
+                creator=user,
+            )
+            order += 1
+
+        JournalEntryLine.objects.create(
+            journal_entry=je,
+            account=payable_account,
+            description=f"Accounts Payable - Bill {bill.bill_number}",
+            debit=0,
+            credit=bill.total_amount,
+            line_order=order,
+            creator=user,
+        )
+
+        je.post()
+        bill.journal_entry = je
+        bill.save(update_fields=["journal_entry", "updated_at"])
+
+
+class SupplierPaymentPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+def _get_payment(pk):
+    try:
+        return SupplierPayment.objects.get(pk=pk, is_deleted=False)
+    except SupplierPayment.DoesNotExist:
+        return None
+
+
+class SupplierPaymentListCreateAPI(APIView):
+    """
+    GET  /purchases/supplier-payments/
+    POST /purchases/supplier-payments/
+    """
+
+    permission_classes = [IsAuthenticated]
+    pagination_class = SupplierPaymentPagination
+
+    def get(self, request):
+        qs = SupplierPayment.objects.filter(is_deleted=False).select_related("supplier", "paid_through")
+        search = request.query_params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(payment_number__icontains=search)
+                | Q(supplier__company_name__icontains=search)
+                | Q(description__icontains=search)
+            )
+        supplier = request.query_params.get("supplier")
+        if supplier:
+            qs = qs.filter(supplier_id=supplier)
+        payment_type = request.query_params.get("payment_type")
+        if payment_type:
+            qs = qs.filter(payment_type=payment_type)
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs.order_by("-payment_date", "-created_at"), request)
+        return paginator.get_paginated_response(SupplierPaymentSerializer(page, many=True).data)
+
+    def post(self, request):
+        serializer = SupplierPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        allocations = request.data.get("allocations", [])
+
+        try:
+            with transaction.atomic():
+                payment = serializer.save(creator=request.user)
+                self._replace_allocations(payment, allocations, user=request.user)
+                payment.refresh_from_db()
+        except ValueError as exc:
+            return Response(
+                {"error": "VALIDATION_ERROR", "message": str(exc)},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        return Response(SupplierPaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+
+    def _replace_allocations(self, payment: SupplierPayment, allocations, user):
+        total_applied = Decimal("0")
+        if payment.payment_type == "advance_payment":
+            allocations = []
+
+        for row in allocations:
+            bill_id = row.get("bill")
+            amount = Decimal(str(row.get("amount", "0")))
+            if amount <= 0:
+                continue
+            bill = Bill.objects.filter(pk=bill_id, is_deleted=False).first()
+            if not bill:
+                raise ValueError(f"Invalid bill: {bill_id}")
+            if bill.supplier_id != payment.supplier_id:
+                raise ValueError("Bill supplier must match payment supplier.")
+            if bill.status != "posted":
+                raise ValueError(f"Bill {bill.bill_number} must be posted before payment.")
+            if amount > bill.balance_amount:
+                raise ValueError(f"Applied amount exceeds current bill balance for {bill.bill_number}.")
+
+            SupplierPaymentAllocation.objects.create(
+                payment=payment,
+                bill=bill,
+                amount=amount,
+                creator=user,
+            )
+            bill.paid_amount = (bill.paid_amount or Decimal("0")) + amount
+            bill.save(update_fields=["paid_amount", "updated_at"])
+            total_applied += amount
+
+        if total_applied > payment.amount_paid:
+            raise ValueError("Total applied amount cannot exceed amount_paid.")
+
+
+class SupplierPaymentDetailAPI(APIView):
+    """
+    GET/PATCH/DELETE /purchases/supplier-payments/<uuid>/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        payment = _get_payment(pk)
+        if not payment:
+            return Response({"error": "NOT_FOUND", "message": "Supplier payment not found."}, status=404)
+        return Response(SupplierPaymentSerializer(payment).data)
+
+    def patch(self, request, pk):
+        payment = _get_payment(pk)
+        if not payment:
+            return Response({"error": "NOT_FOUND", "message": "Supplier payment not found."}, status=404)
+        serializer = SupplierPaymentSerializer(payment, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        allocations = request.data.get("allocations", None)
+        try:
+            with transaction.atomic():
+                self._rollback_allocations(payment)
+                payment = serializer.save(updator=request.user)
+                if allocations is not None:
+                    self._replace_allocations(payment, allocations, user=request.user)
+                payment.refresh_from_db()
+        except ValueError as exc:
+            return Response(
+                {"error": "VALIDATION_ERROR", "message": str(exc)},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        return Response(SupplierPaymentSerializer(payment).data)
+
+    def delete(self, request, pk):
+        payment = _get_payment(pk)
+        if not payment:
+            return Response({"error": "NOT_FOUND", "message": "Supplier payment not found."}, status=404)
+        with transaction.atomic():
+            self._rollback_allocations(payment)
+            payment.is_deleted = True
+            payment.save(update_fields=["is_deleted", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _rollback_allocations(self, payment: SupplierPayment):
+        for allocation in payment.allocations.filter(is_deleted=False).select_related("bill"):
+            bill = allocation.bill
+            bill.paid_amount = (bill.paid_amount or Decimal("0")) - allocation.amount
+            if bill.paid_amount < 0:
+                bill.paid_amount = Decimal("0")
+            bill.save(update_fields=["paid_amount", "updated_at"])
+        payment.allocations.filter(is_deleted=False).update(is_deleted=True)
+
+    def _replace_allocations(self, payment: SupplierPayment, allocations, user):
+        return SupplierPaymentListCreateAPI()._replace_allocations(payment, allocations, user)
+
+
+class SupplierOutstandingBillsAPI(APIView):
+    """
+    GET /purchases/supplier-payments/outstanding-bills/?supplier=<uuid>
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        supplier_id = request.query_params.get("supplier")
+        if not supplier_id:
+            return Response(
+                {"error": "SUPPLIER_REQUIRED", "message": "supplier query param is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        bills = Bill.objects.filter(
+            is_deleted=False,
+            status="posted",
+            supplier_id=supplier_id,
+        ).order_by("bill_date", "created_at")
+
+        results = []
+        for bill in bills:
+            balance = bill.balance_amount
+            if balance <= 0:
+                continue
+            results.append(
+                {
+                    "id": str(bill.id),
+                    "bill_number": bill.bill_number,
+                    "bill_date": bill.bill_date,
+                    "total_amount": str(bill.total_amount),
+                    "paid_amount": str(bill.paid_amount),
+                    "balance_amount": str(balance),
+                }
+            )
+        return Response({"results": results, "payment_types": [{"id": k, "label": v} for k, v in SUPPLIER_PAYMENT_TYPE_CHOICES]})
+
+
+class DebitNotePagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+def _get_debit_note(pk):
+    try:
+        return DebitNote.objects.get(pk=pk, is_deleted=False)
+    except DebitNote.DoesNotExist:
+        return None
+
+
+class DebitNoteListCreateAPI(APIView):
+    """
+    GET  /purchases/debit-notes/
+    POST /purchases/debit-notes/
+    """
+
+    permission_classes = [IsAuthenticated]
+    pagination_class = DebitNotePagination
+
+    def get(self, request):
+        qs = DebitNote.objects.filter(is_deleted=False).select_related("supplier")
+        search = request.query_params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(debit_note_number__icontains=search)
+                | Q(note__icontains=search)
+                | Q(supplier__company_name__icontains=search)
+            )
+        supplier = request.query_params.get("supplier")
+        if supplier:
+            qs = qs.filter(supplier_id=supplier)
+        status_param = request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        date_from = request.query_params.get("date_from")
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        date_to = request.query_params.get("date_to")
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs.order_by("-date", "-created_at"), request)
+        return paginator.get_paginated_response(DebitNoteSerializer(page, many=True).data)
+
+    def post(self, request):
+        serializer = DebitNoteSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        note = serializer.save()
+        return Response(DebitNoteSerializer(note).data, status=status.HTTP_201_CREATED)
+
+
+class DebitNoteDetailAPI(APIView):
+    """
+    GET/PATCH/DELETE /purchases/debit-notes/<uuid>/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        note = _get_debit_note(pk)
+        if not note:
+            return Response({"error": "NOT_FOUND", "message": "Debit note not found."}, status=404)
+        return Response(DebitNoteSerializer(note).data)
+
+    def patch(self, request, pk):
+        note = _get_debit_note(pk)
+        if not note:
+            return Response({"error": "NOT_FOUND", "message": "Debit note not found."}, status=404)
+        serializer = DebitNoteSerializer(note, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        note = serializer.save()
+        return Response(DebitNoteSerializer(note).data)
+
+    def delete(self, request, pk):
+        note = _get_debit_note(pk)
+        if not note:
+            return Response({"error": "NOT_FOUND", "message": "Debit note not found."}, status=404)
+        if note.status == "posted":
+            return Response(
+                {"error": "DEBIT_NOTE_POSTED", "message": "Posted debit note cannot be deleted."},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        note.is_deleted = True
+        note.save(update_fields=["is_deleted", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
