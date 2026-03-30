@@ -173,6 +173,7 @@ class BillSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "bill_number",
+            "external_reference",
             "supplier",
             "supplier_name",
             "bill_date",
@@ -215,6 +216,10 @@ class BillSerializer(serializers.ModelSerializer):
         lines = attrs.get("lines")
         if self.instance is None and (not lines or len(lines) == 0):
             raise serializers.ValidationError({"lines": "At least one bill line is required."})
+        if self.instance is None and not (attrs.get("external_reference") or "").strip():
+            raise serializers.ValidationError(
+                {"external_reference": "external_reference is required for deduplication safety."}
+            )
         return attrs
 
     def create(self, validated_data):
@@ -264,7 +269,6 @@ class BillSerializer(serializers.ModelSerializer):
 
 
 class BillPostSerializer(serializers.Serializer):
-    create_journal_entry = serializers.BooleanField(required=False, default=False)
     payable_account = serializers.UUIDField(required=False)
     vat_account = serializers.UUIDField(required=False)
     posting_date = serializers.DateField(required=False)
@@ -298,6 +302,7 @@ class BillListSerializer(serializers.ModelSerializer):
             "status",
             "status_display",
             "bill_number",
+            "external_reference",
             "supplier",
             "supplier_name",
             "bill_date",
@@ -396,6 +401,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
             "payment_date",
             "description",
             "is_posted",
+            "journal_entry",
             "amount_applied",
             "remaining_amount",
             "allocations",
@@ -410,6 +416,7 @@ class SupplierPaymentSerializer(serializers.ModelSerializer):
             "payment_type_display",
             "amount_applied",
             "remaining_amount",
+            "journal_entry",
             "created_at",
             "updated_at",
         ]

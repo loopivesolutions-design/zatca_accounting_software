@@ -12,6 +12,7 @@ from django.shortcuts import get_object_or_404
 
 from main.pagination import CustomPagination
 from main.management.commands.create_groups_and_permissions import IsAdmin
+from main.idempotency import begin_idempotent, finalize_idempotent_failure, finalize_idempotent_success
 
 from .serializers import (
     AdminLoginSerializer,
@@ -248,15 +249,20 @@ class SendInvitationAPI(APIView):
     permission_classes = [IsAuthenticated, IsAdmin]
 
     def post(self, request):
+        rec, early = begin_idempotent(request, scope="user.invitations.send")
+        if early:
+            return early
         serializer = SendInvitationBulkSerializer(
             data=request.data, context={"request": request}
         )
         serializer.is_valid(raise_exception=True)
         result = serializer.save()
-        return Response(
+        response = Response(
             {"message": "Invitations sent.", "invitations": len(result["invitations"])},
             status=status.HTTP_201_CREATED,
         )
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 class ResendInvitationAPI(APIView):
@@ -264,6 +270,9 @@ class ResendInvitationAPI(APIView):
     permission_classes = [IsAuthenticated, IsAdmin]
 
     def post(self, request, pk):
+        rec, early = begin_idempotent(request, scope="user.invitations.resend")
+        if early:
+            return early
         try:
             inv = UserInvitation.objects.select_related("role", "invited_by").get(
                 pk=pk,
@@ -271,9 +280,11 @@ class ResendInvitationAPI(APIView):
                 is_expired=False,
             )
         except UserInvitation.DoesNotExist:
-            return Response(
-                {"error": "Invitation not found or already accepted/expired."},
-                status=status.HTTP_404_NOT_FOUND,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="NOT_FOUND",
+                message="Invitation not found or already accepted/expired.",
+                http_status=status.HTTP_404_NOT_FOUND,
             )
 
         import secrets
@@ -281,4 +292,6 @@ class ResendInvitationAPI(APIView):
         inv.save(update_fields=["token", "updated_at"])
 
         send_invitation_email(inv, request.user)
-        return Response({"message": f"Invitation resent to {inv.email}."}, status=status.HTTP_200_OK)
+        response = Response({"message": f"Invitation resent to {inv.email}."}, status=status.HTTP_200_OK)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response

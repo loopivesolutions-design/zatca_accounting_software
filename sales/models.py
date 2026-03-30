@@ -1,9 +1,12 @@
 from decimal import Decimal
 
+from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import F, Q
 from django.utils.translation import gettext_lazy as _
 
 from main.models import BaseModel
+from main.money import get_vat_rounding_strategy, money, vat_amount
 
 
 CUSTOMER_PAYMENT_TERMS_CHOICES = (
@@ -42,6 +45,29 @@ INVOICE_STATUS_CHOICES = (
     ("overdue", "Overdue"),
 )
 
+ZATCA_SUBMISSION_STATUS_CHOICES = (
+    ("not_submitted", "Not Submitted"),
+    ("signed", "Signed (artifacts ready)"),
+    ("submitted", "Submitted (awaiting authority)"),
+    ("retrying", "Retrying"),
+    ("reported", "Reported"),
+    ("cleared", "Cleared"),
+    ("rejected", "Rejected"),
+    ("failed_final", "Failed Final"),
+)
+
+ZATCA_SUBMISSION_TYPE_CHOICES = (
+    ("clearance", "Clearance"),
+    ("reporting", "Reporting"),
+)
+
+ZATCA_WORKFLOW_STATUS_CHOICES = (
+    ("pending", "Pending"),
+    ("retrying", "Retrying"),
+    ("succeeded", "Succeeded"),
+    ("failed_final", "Failed Final"),
+)
+
 CUSTOMER_PAYMENT_TYPE_CHOICES = (
     ("invoice_payment", "Invoice Payments"),
     ("advance_payment", "Advance Payments"),
@@ -51,6 +77,26 @@ CUSTOMER_CREDIT_NOTE_STATUS_CHOICES = (
     ("draft", "Draft"),
     ("posted", "Posted"),
 )
+
+
+class ZatcaHashSealMixin:
+    """Prevent tampering with stored ZATCA hash inputs after first seal."""
+
+    _ZATCA_IMMUTABLE_HASH_FIELDS = ("zatca_previous_hash", "zatca_invoice_hash", "zatca_canonical_xml")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .only("zatca_previous_hash", "zatca_invoice_hash", "zatca_canonical_xml")
+                .first()
+            )
+            if previous and (previous.zatca_invoice_hash or "").strip():
+                for f in self._ZATCA_IMMUTABLE_HASH_FIELDS:
+                    if (getattr(self, f) or "") != (getattr(previous, f) or ""):
+                        raise ValidationError(f"ZATCA hash artifacts are immutable once set ({f}).")
+        super().save(*args, **kwargs)
 
 
 class Customer(BaseModel):
@@ -165,16 +211,17 @@ class Quote(BaseModel):
         discount = Decimal("0")
         vat = Decimal("0")
         total = Decimal("0")
+        strategy = get_vat_rounding_strategy()
         for line in lines:
-            subtotal += line.gross_amount()
-            discount += line.discount_amount()
-            vat += line.tax_amount()
-            total += line.total()
+            subtotal += money(line.gross_amount())
+            discount += money(line.discount_amount())
+            vat += line.tax_amount(strategy=strategy)
+            total += line.total(strategy=strategy)
 
-        self.subtotal_before_discount = subtotal
-        self.discount_total = discount
-        self.total_vat = vat
-        self.total_amount = total
+        self.subtotal_before_discount = money(subtotal)
+        self.discount_total = money(discount)
+        self.total_vat = money(vat) if strategy == "invoice" else money(vat)
+        self.total_amount = money(total) if strategy == "invoice" else money(total)
         self.save(
             update_fields=[
                 "subtotal_before_discount",
@@ -227,19 +274,28 @@ class QuoteLine(BaseModel):
         return (gross * (self.discount_percent or Decimal("0"))) / Decimal("100")
 
     def subtotal(self) -> Decimal:
-        return self.gross_amount() - self.discount_amount()
+        return money(self.gross_amount() - self.discount_amount())
 
-    def tax_amount(self) -> Decimal:
+    def tax_amount(self, *, strategy: str | None = None) -> Decimal:
         if not self.tax_rate:
             return Decimal("0")
-        return (self.subtotal() * self.tax_rate.rate) / Decimal("100")
+        return vat_amount(self.subtotal(), self.tax_rate.rate, strategy=strategy)
 
-    def total(self) -> Decimal:
-        return self.subtotal() + self.tax_amount()
+    def total(self, *, strategy: str | None = None) -> Decimal:
+        strat = (strategy or get_vat_rounding_strategy()).strip().lower()
+        vat = self.tax_amount(strategy=strat)
+        return money(self.subtotal() + (money(vat) if strat == "invoice" else vat))
 
 
-class Invoice(BaseModel):
+class Invoice(ZatcaHashSealMixin, BaseModel):
     invoice_number = models.CharField(_("Invoice Number"), max_length=30, unique=True, db_index=True)
+    external_reference = models.CharField(
+        _("External Reference"),
+        max_length=100,
+        blank=True,
+        db_index=True,
+        help_text=_("Client/system reference for idempotent business deduplication."),
+    )
     customer = models.ForeignKey(
         "sales.Customer",
         on_delete=models.PROTECT,
@@ -259,6 +315,39 @@ class Invoice(BaseModel):
     )
     posted_at = models.DateTimeField(_("Posted At"), null=True, blank=True)
     qr_code_text = models.TextField(_("QR Code Text"), blank=True)
+    zatca_uuid = models.CharField(_("ZATCA UUID"), max_length=64, blank=True, db_index=True)
+    zatca_previous_hash = models.CharField(_("ZATCA Previous Invoice Hash"), max_length=128, blank=True)
+    zatca_invoice_hash = models.CharField(_("ZATCA Invoice Hash"), max_length=128, blank=True)
+    zatca_signed_hash = models.CharField(_("ZATCA Signed Hash"), max_length=128, blank=True)
+    zatca_xml = models.TextField(_("ZATCA UBL XML"), blank=True)
+    zatca_canonical_xml = models.TextField(_("ZATCA Canonical XML"), blank=True)
+    zatca_signature_value = models.TextField(_("ZATCA Signature Value (Base64)"), blank=True)
+    zatca_signed_xml = models.TextField(_("ZATCA Signed XML"), blank=True)
+    zatca_certificate = models.ForeignKey(
+        "sales.ZatcaCertificate",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoices",
+        verbose_name=_("ZATCA Certificate Used"),
+    )
+    zatca_submission_status = models.CharField(
+        _("ZATCA Submission Status"),
+        max_length=20,
+        choices=ZATCA_SUBMISSION_STATUS_CHOICES,
+        default="not_submitted",
+        db_index=True,
+    )
+    zatca_submission_type = models.CharField(
+        _("ZATCA Submission Type"),
+        max_length=20,
+        choices=ZATCA_SUBMISSION_TYPE_CHOICES,
+        blank=True,
+    )
+    zatca_submission_reference = models.CharField(_("ZATCA Submission Reference"), max_length=100, blank=True)
+    zatca_submission_error = models.TextField(_("ZATCA Submission Error"), blank=True)
+    zatca_submitted_at = models.DateTimeField(_("ZATCA Submitted At"), null=True, blank=True)
+    zatca_cleared_at = models.DateTimeField(_("ZATCA Cleared/Reported At"), null=True, blank=True)
     journal_entry = models.OneToOneField(
         "accounting.JournalEntry",
         on_delete=models.SET_NULL,
@@ -276,6 +365,21 @@ class Invoice(BaseModel):
     class Meta:
         db_table = "sales_invoice"
         ordering = ["-date", "-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=~models.Q(status="posted") | models.Q(journal_entry__isnull=False),
+                name="invoice_posted_requires_journal_entry",
+            ),
+            models.CheckConstraint(
+                check=Q(paid_amount__gte=0) & Q(paid_amount__lte=F("total_amount")),
+                name="invoice_paid_lte_total_nonneg",
+            ),
+            models.UniqueConstraint(
+                fields=["customer", "external_reference"],
+                condition=~models.Q(external_reference=""),
+                name="uniq_invoice_customer_external_reference",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.invoice_number
@@ -290,13 +394,14 @@ class Invoice(BaseModel):
         subtotal = Decimal("0")
         vat = Decimal("0")
         total = Decimal("0")
+        strategy = get_vat_rounding_strategy()
         for line in lines:
             subtotal += line.subtotal()
-            vat += line.tax_amount()
-            total += line.total()
-        self.subtotal = subtotal
-        self.total_vat = vat
-        self.total_amount = total
+            vat += line.tax_amount(strategy=strategy)
+            total += line.total(strategy=strategy)
+        self.subtotal = money(subtotal)
+        self.total_vat = money(vat) if strategy == "invoice" else money(vat)
+        self.total_amount = money(total) if strategy == "invoice" else money(total)
         self.save(update_fields=["subtotal", "total_vat", "total_amount", "updated_at"])
 
 
@@ -347,15 +452,17 @@ class InvoiceLine(BaseModel):
         return (gross * (self.discount_percent or Decimal("0"))) / Decimal("100")
 
     def subtotal(self) -> Decimal:
-        return self.gross_amount() - self.discount_amount()
+        return money(self.gross_amount() - self.discount_amount())
 
-    def tax_amount(self) -> Decimal:
+    def tax_amount(self, *, strategy: str | None = None) -> Decimal:
         if not self.tax_rate:
             return Decimal("0")
-        return (self.subtotal() * self.tax_rate.rate) / Decimal("100")
+        return vat_amount(self.subtotal(), self.tax_rate.rate, strategy=strategy)
 
-    def total(self) -> Decimal:
-        return self.subtotal() + self.tax_amount()
+    def total(self, *, strategy: str | None = None) -> Decimal:
+        strat = (strategy or get_vat_rounding_strategy()).strip().lower()
+        vat = self.tax_amount(strategy=strat)
+        return money(self.subtotal() + (money(vat) if strat == "invoice" else vat))
 
 
 class CustomerPayment(BaseModel):
@@ -384,6 +491,14 @@ class CustomerPayment(BaseModel):
     payment_date = models.DateField(_("Payment Date"), db_index=True)
     description = models.TextField(_("Description"), blank=True)
     is_posted = models.BooleanField(_("Posted"), default=True, db_index=True)
+    journal_entry = models.OneToOneField(
+        "accounting.JournalEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sales_customer_payment",
+        verbose_name=_("Journal Entry"),
+    )
 
     class Meta:
         db_table = "customer_payment"
@@ -423,8 +538,15 @@ class CustomerPaymentAllocation(BaseModel):
         ordering = ["created_at"]
 
 
-class CustomerCreditNote(BaseModel):
+class CustomerCreditNote(ZatcaHashSealMixin, BaseModel):
     credit_note_number = models.CharField(_("Credit Note Number"), max_length=30, unique=True, db_index=True)
+    external_reference = models.CharField(
+        _("External Reference"),
+        max_length=100,
+        blank=True,
+        db_index=True,
+        help_text=_("Client/system reference for idempotent business deduplication."),
+    )
     customer = models.ForeignKey(
         "sales.Customer",
         on_delete=models.PROTECT,
@@ -443,6 +565,39 @@ class CustomerCreditNote(BaseModel):
     )
     posted_at = models.DateTimeField(_("Posted At"), null=True, blank=True)
     qr_code_text = models.TextField(_("QR Code Text"), blank=True)
+    zatca_uuid = models.CharField(_("ZATCA UUID"), max_length=64, blank=True, db_index=True)
+    zatca_previous_hash = models.CharField(_("ZATCA Previous Invoice Hash"), max_length=128, blank=True)
+    zatca_invoice_hash = models.CharField(_("ZATCA Invoice Hash"), max_length=128, blank=True)
+    zatca_signed_hash = models.CharField(_("ZATCA Signed Hash"), max_length=128, blank=True)
+    zatca_xml = models.TextField(_("ZATCA UBL XML"), blank=True)
+    zatca_canonical_xml = models.TextField(_("ZATCA Canonical XML"), blank=True)
+    zatca_signature_value = models.TextField(_("ZATCA Signature Value (Base64)"), blank=True)
+    zatca_signed_xml = models.TextField(_("ZATCA Signed XML"), blank=True)
+    zatca_certificate = models.ForeignKey(
+        "sales.ZatcaCertificate",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="credit_notes",
+        verbose_name=_("ZATCA Certificate Used"),
+    )
+    zatca_submission_status = models.CharField(
+        _("ZATCA Submission Status"),
+        max_length=20,
+        choices=ZATCA_SUBMISSION_STATUS_CHOICES,
+        default="not_submitted",
+        db_index=True,
+    )
+    zatca_submission_type = models.CharField(
+        _("ZATCA Submission Type"),
+        max_length=20,
+        choices=ZATCA_SUBMISSION_TYPE_CHOICES,
+        blank=True,
+    )
+    zatca_submission_reference = models.CharField(_("ZATCA Submission Reference"), max_length=100, blank=True)
+    zatca_submission_error = models.TextField(_("ZATCA Submission Error"), blank=True)
+    zatca_submitted_at = models.DateTimeField(_("ZATCA Submitted At"), null=True, blank=True)
+    zatca_cleared_at = models.DateTimeField(_("ZATCA Cleared/Reported At"), null=True, blank=True)
     journal_entry = models.OneToOneField(
         "accounting.JournalEntry",
         on_delete=models.SET_NULL,
@@ -459,6 +614,21 @@ class CustomerCreditNote(BaseModel):
     class Meta:
         db_table = "customer_credit_note"
         ordering = ["-date", "-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=~models.Q(status="posted") | models.Q(journal_entry__isnull=False),
+                name="credit_note_posted_requires_journal_entry",
+            ),
+            models.CheckConstraint(
+                check=Q(refunded_amount__gte=0) & Q(refunded_amount__lte=F("total_amount")),
+                name="credit_note_refunded_lte_total_nonneg",
+            ),
+            models.UniqueConstraint(
+                fields=["customer", "external_reference"],
+                condition=~models.Q(external_reference=""),
+                name="uniq_credit_note_customer_external_reference",
+            ),
+        ]
 
     @property
     def balance_amount(self) -> Decimal:
@@ -470,13 +640,14 @@ class CustomerCreditNote(BaseModel):
         subtotal = Decimal("0")
         vat = Decimal("0")
         total = Decimal("0")
+        strategy = get_vat_rounding_strategy()
         for line in lines:
             subtotal += line.subtotal()
-            vat += line.tax_amount()
-            total += line.total()
-        self.subtotal = subtotal
-        self.total_vat = vat
-        self.total_amount = total
+            vat += line.tax_amount(strategy=strategy)
+            total += line.total(strategy=strategy)
+        self.subtotal = money(subtotal)
+        self.total_vat = money(vat) if strategy == "invoice" else money(vat)
+        self.total_amount = money(total) if strategy == "invoice" else money(total)
         self.save(update_fields=["subtotal", "total_vat", "total_amount", "updated_at"])
 
 
@@ -527,15 +698,17 @@ class CustomerCreditNoteLine(BaseModel):
         return (gross * (self.discount_percent or Decimal("0"))) / Decimal("100")
 
     def subtotal(self) -> Decimal:
-        return self.gross_amount() - self.discount_amount()
+        return money(self.gross_amount() - self.discount_amount())
 
-    def tax_amount(self) -> Decimal:
+    def tax_amount(self, *, strategy: str | None = None) -> Decimal:
         if not self.tax_rate:
             return Decimal("0")
-        return (self.subtotal() * self.tax_rate.rate) / Decimal("100")
+        return vat_amount(self.subtotal(), self.tax_rate.rate, strategy=strategy)
 
-    def total(self) -> Decimal:
-        return self.subtotal() + self.tax_amount()
+    def total(self, *, strategy: str | None = None) -> Decimal:
+        strat = (strategy or get_vat_rounding_strategy()).strip().lower()
+        vat = self.tax_amount(strategy=strat)
+        return money(self.subtotal() + (money(vat) if strat == "invoice" else vat))
 
 
 class CustomerRefund(BaseModel):
@@ -557,6 +730,14 @@ class CustomerRefund(BaseModel):
     refund_date = models.DateField(_("Refund Date"), db_index=True)
     description = models.TextField(_("Description"), blank=True)
     is_posted = models.BooleanField(_("Posted"), default=True, db_index=True)
+    journal_entry = models.OneToOneField(
+        "accounting.JournalEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sales_customer_refund",
+        verbose_name=_("Journal Entry"),
+    )
 
     class Meta:
         db_table = "customer_refund"
@@ -591,4 +772,179 @@ class CustomerRefundAllocation(BaseModel):
     class Meta:
         db_table = "customer_refund_allocation"
         ordering = ["created_at"]
+
+
+class ZatcaSubmissionLog(BaseModel):
+    """Idempotent submission ledger for retry/audit workflow."""
+    document_type = models.CharField(_("Document Type"), max_length=20, db_index=True)  # invoice|credit_note
+    document_id = models.UUIDField(_("Document ID"), db_index=True)
+    submission_type = models.CharField(
+        _("Submission Type"),
+        max_length=20,
+        choices=ZATCA_SUBMISSION_TYPE_CHOICES,
+        db_index=True,
+    )
+    # Unique per document_type to avoid collisions across invoices vs credit notes.
+    idempotency_key = models.CharField(_("Idempotency Key"), max_length=120, db_index=True)
+    status = models.CharField(
+        _("Workflow Status"),
+        max_length=20,
+        choices=ZATCA_WORKFLOW_STATUS_CHOICES,
+        default="pending",
+        db_index=True,
+    )
+    attempt_count = models.PositiveIntegerField(_("Attempt Count"), default=0)
+    next_retry_at = models.DateTimeField(_("Next Retry At"), null=True, blank=True)
+    last_error = models.TextField(_("Last Error"), blank=True)
+    response_reference = models.CharField(_("Response Reference"), max_length=100, blank=True)
+    provider_request_id = models.CharField(_("Provider Request ID"), max_length=120, blank=True, db_index=True)
+    provider_correlation_id = models.CharField(_("Provider Correlation ID"), max_length=120, blank=True, db_index=True)
+    provider_status = models.CharField(_("Provider Status"), max_length=80, blank=True, db_index=True)
+    response_headers = models.JSONField(_("Response Headers"), default=dict, blank=True)
+    submitted_at = models.DateTimeField(_("Submitted At"), null=True, blank=True)
+
+    class Meta:
+        db_table = "sales_zatca_submission_log"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["document_type", "idempotency_key"], name="uniq_zatca_log_doc_type_key"),
+        ]
+
+
+class ZatcaSubmissionStatusLog(BaseModel):
+    """Append-only audit trail for ZATCA submission status transitions on a document."""
+
+    document_type = models.CharField(max_length=20, db_index=True)  # invoice|credit_note
+    document_id = models.UUIDField(db_index=True)
+    from_status = models.CharField(max_length=40, db_index=True)
+    to_status = models.CharField(max_length=40, db_index=True)
+    actor = models.ForeignKey(
+        "user.CustomUser",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="zatca_submission_status_logs",
+        verbose_name=_("Actor"),
+    )
+
+    class Meta:
+        db_table = "sales_zatca_submission_status_log"
+        ordering = ["created_at"]
+
+
+class ZatcaEvidenceBundle(BaseModel):
+    """Immutable evidence bundle for audit (request/response + artifacts)."""
+    document_type = models.CharField(max_length=20, db_index=True)  # invoice|credit_note
+    document_id = models.UUIDField(db_index=True)
+    submission_type = models.CharField(max_length=20, choices=ZATCA_SUBMISSION_TYPE_CHOICES, db_index=True)
+    idempotency_key = models.CharField(max_length=120, db_index=True)
+    request_payload = models.TextField(blank=True)
+    response_payload = models.TextField(blank=True)
+    http_status = models.PositiveIntegerField(null=True, blank=True)
+    reference = models.CharField(max_length=100, blank=True)
+    api_request_headers = models.JSONField(_("API Request Headers"), default=dict, blank=True)
+    api_response_headers = models.JSONField(_("API Response Headers"), default=dict, blank=True)
+    certificate_sha256 = models.CharField(_("Leaf certificate SHA-256 (DER)"), max_length=128, blank=True)
+
+    def is_complete(self) -> bool:
+        """Mandatory audit fields for live ZATCA evidence bundles (request/response + cert fingerprint)."""
+        if not (self.request_payload or "").strip():
+            return False
+        if not (self.response_payload or "").strip():
+            return False
+        if self.http_status is None:
+            return False
+        if not (self.certificate_sha256 or "").strip():
+            return False
+        req = self.api_request_headers
+        if not isinstance(req, dict) or not req:
+            return False
+        return True
+
+    class Meta:
+        db_table = "sales_zatca_evidence_bundle"
+        ordering = ["-created_at"]
+
+
+class ZatcaCertificate(BaseModel):
+    """Certificate metadata and storage pointers (no private key bytes in DB)."""
+    name = models.CharField(max_length=100, unique=True)
+    certificate_pem = models.TextField(blank=True)
+    private_key_path = models.CharField(max_length=255, blank=True)
+    is_active = models.BooleanField(default=False, db_index=True)
+    activated_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sales_zatca_certificate"
+        ordering = ["-created_at"]
+
+
+ZATCA_OUTBOX_STATUS_CHOICES = (
+    ("pending", "Pending"),
+    ("processing", "Processing"),
+    ("retrying", "Retrying"),
+    ("succeeded", "Succeeded"),
+    ("failed_final", "Failed Final"),
+)
+
+
+class ZatcaOutboxEvent(BaseModel):
+    """Durable outbox for ZATCA submissions (worker processes asynchronously)."""
+    document_type = models.CharField(max_length=20, db_index=True)  # invoice|credit_note
+    document_id = models.UUIDField(db_index=True)
+    submission_type = models.CharField(max_length=20, choices=ZATCA_SUBMISSION_TYPE_CHOICES, db_index=True)
+    idempotency_key = models.CharField(max_length=120, db_index=True)
+    status = models.CharField(max_length=20, choices=ZATCA_OUTBOX_STATUS_CHOICES, default="pending", db_index=True)
+    attempt_count = models.PositiveIntegerField(default=0)
+    next_retry_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    locked_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "sales_zatca_outbox_event"
+        ordering = ["created_at"]
+        constraints = [
+            # Prevent accidentally queuing duplicates for the same document + key.
+            models.UniqueConstraint(
+                fields=["document_type", "document_id", "submission_type", "idempotency_key"],
+                name="uniq_zatca_outbox_doc_key",
+            ),
+        ]
+
+
+class ZatcaControlSequence(BaseModel):
+    """
+    Persistent control sequence values used by ZATCA business references (e.g., ICV).
+    """
+    scope = models.CharField(max_length=80, unique=True, db_index=True)
+    next_value = models.BigIntegerField(default=1)
+
+    class Meta:
+        db_table = "sales_zatca_control_sequence"
+        ordering = ["scope"]
+
+
+class ZatcaHashChainAnchor(BaseModel):
+    """
+    Operational anchor for hash-chain health (DB restore / manual fix can break the chain).
+    Updated by verify_zatca_hash_chain; read before posting new ZATCA-linked sales documents.
+    """
+
+    last_verified_hash = models.CharField(max_length=128, blank=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+    chain_integrity_ok = models.BooleanField(default=True, db_index=True)
+    last_run_summary = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "sales_zatca_hash_chain_anchor"
+        verbose_name = _("ZATCA hash chain anchor")
+        ordering = ["created_at"]
+
+    @classmethod
+    def get_solo(cls):
+        obj = cls.objects.filter(is_deleted=False).order_by("created_at").first()
+        if obj:
+            return obj
+        return cls.objects.create()
 

@@ -1,13 +1,23 @@
+import json
+import uuid
+
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.db import transaction
 from rest_framework.pagination import PageNumberPagination
 from decimal import Decimal
 
+from main.approvals import create_approval_request, maker_checker_enabled
+
 from accounting.models import JournalEntry, JournalEntryLine, Account
+from main.management.commands.create_groups_and_permissions import IsAdmin
+from main.idempotency import begin_idempotent, finalize_idempotent_failure, finalize_idempotent_success
+from accounting.permissions import CanPostPurchases
+from accounting.services.posting import post_bill_journal, post_supplier_payment_journal
+from purchases.supplier_payment_posting import apply_supplier_payment_allocations
 from .models import (
     Supplier,
     PAYMENT_TERMS_CHOICES,
@@ -193,10 +203,15 @@ class BillListCreateAPI(APIView):
         return paginator.get_paginated_response(BillListSerializer(page, many=True).data)
 
     def post(self, request):
+        rec, early = begin_idempotent(request, scope="purchases.bill.create")
+        if early:
+            return early
         serializer = BillSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         bill = serializer.save()
-        return Response(BillSerializer(bill).data, status=status.HTTP_201_CREATED)
+        response = Response(BillSerializer(bill).data, status=status.HTTP_201_CREATED)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 class BillDetailAPI(APIView):
@@ -213,26 +228,40 @@ class BillDetailAPI(APIView):
         return Response(BillSerializer(bill).data)
 
     def patch(self, request, pk):
-        bill = _get_bill(pk)
-        if not bill:
-            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
-        serializer = BillSerializer(bill, data=request.data, partial=True, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        bill = serializer.save()
-        return Response(BillSerializer(bill).data)
+        rec, early = begin_idempotent(request, scope="purchases.bill.update")
+        if early:
+            return early
+        with transaction.atomic():
+            bill = Bill.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+            if not bill:
+                return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Bill not found.", http_status=404)  # type: ignore[arg-type]
+            serializer = BillSerializer(bill, data=request.data, partial=True, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            bill = serializer.save()
+        response = Response(BillSerializer(bill).data)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
     def delete(self, request, pk):
-        bill = _get_bill(pk)
-        if not bill:
-            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
-        if bill.status == "posted":
-            return Response(
-                {"error": "BILL_POSTED", "message": "Posted bill cannot be deleted."},
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            )
-        bill.is_deleted = True
-        bill.save(update_fields=["is_deleted", "updated_at"])
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        rec, early = begin_idempotent(request, scope="purchases.bill.delete")
+        if early:
+            return early
+        with transaction.atomic():
+            bill = Bill.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+            if not bill:
+                return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Bill not found.", http_status=404)  # type: ignore[arg-type]
+            if bill.status == "posted":
+                return finalize_idempotent_failure(
+                    rec,  # type: ignore[arg-type]
+                    error="BILL_POSTED",
+                    message="Posted bill cannot be deleted.",
+                    http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+            bill.is_deleted = True
+            bill.save(update_fields=["is_deleted", "updated_at"])
+        response = Response(status=status.HTTP_204_NO_CONTENT)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 class BillPostAPI(APIView):
@@ -240,119 +269,68 @@ class BillPostAPI(APIView):
     POST /purchases/bills/<uuid>/post/
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanPostPurchases]
 
     def post(self, request, pk):
-        bill = _get_bill(pk)
-        if not bill:
-            return Response({"error": "NOT_FOUND", "message": "Bill not found."}, status=404)
+        rec, early = begin_idempotent(request, scope="purchases.bill.post")
+        if early:
+            return early
 
-        serializer = BillPostSerializer(data=request.data, context={"bill": bill})
+        serializer = BillPostSerializer(data=request.data, context={"bill_id": str(pk)})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         with transaction.atomic():
+            bill = Bill.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+            if not bill:
+                return finalize_idempotent_failure(  # type: ignore[arg-type]
+                    rec, error="NOT_FOUND", message="Bill not found.", http_status=404
+                )
+            if bill.status == "posted":
+                response = Response(BillSerializer(bill).data, status=status.HTTP_200_OK)
+                finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+                return response
+
+            if maker_checker_enabled("purchases.bill.post"):
+                payload = json.loads(json.dumps(data, default=str))
+                approval = create_approval_request(
+                    scope="purchases.bill.post",
+                    object_type="purchases.Bill",
+                    object_id=bill.id,
+                    payload=payload,
+                    requested_by=request.user,
+                )
+                response = Response(
+                    {"message": "Approval required.", "approval_id": str(approval.id), "status": approval.status},
+                    status=status.HTTP_202_ACCEPTED,
+                )
+                finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+                return response
+
             try:
-                if data.get("create_journal_entry", False):
-                    self._create_and_post_journal_entry(
-                        bill=bill,
-                        user=request.user,
-                        payable_account_id=data.get("payable_account"),
-                        vat_account_id=data.get("vat_account"),
-                        posting_date=data.get("posting_date"),
-                        memo=data.get("memo", ""),
-                    )
+                je = post_bill_journal(
+                    bill=bill,
+                    user=request.user,
+                    payable_account_id=data.get("payable_account"),
+                    vat_account_id=data.get("vat_account"),
+                    posting_date=data.get("posting_date"),
+                    memo=data.get("memo", ""),
+                )
+                bill.journal_entry = je
+                bill.save(update_fields=["journal_entry", "updated_at"])
             except ValueError as exc:
-                return Response(
-                    {"error": "POST_VALIDATION_ERROR", "message": str(exc)},
-                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                return finalize_idempotent_failure(
+                    rec,  # type: ignore[arg-type]
+                    error="POST_VALIDATION_ERROR",
+                    message=str(exc),
+                    http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 )
 
             bill.mark_posted(user=request.user)
 
-        return Response(BillSerializer(bill).data, status=status.HTTP_200_OK)
-
-    def _create_and_post_journal_entry(
-        self,
-        *,
-        bill: Bill,
-        user,
-        payable_account_id=None,
-        vat_account_id=None,
-        posting_date=None,
-        memo="",
-    ) -> None:
-        payable_account = None
-        if payable_account_id:
-            payable_account = Account.objects.filter(pk=payable_account_id, is_deleted=False).first()
-            if not payable_account:
-                raise ValueError("Invalid payable_account provided.")
-        else:
-            payable_account = Account.objects.filter(code="211", is_deleted=False).first()
-            if not payable_account:
-                raise ValueError("Default Accounts Payable account (code 211) not found.")
-
-        if vat_account_id:
-            vat_account = Account.objects.filter(pk=vat_account_id, is_deleted=False).first()
-            if not vat_account:
-                raise ValueError("Invalid vat_account provided.")
-        else:
-            vat_account = Account.objects.filter(code="116", is_deleted=False).first()
-
-        je = JournalEntry.objects.create(
-            date=posting_date or bill.bill_date,
-            description=memo or f"Purchase Bill {bill.bill_number}",
-            status="draft",
-            creator=user,
-        )
-
-        order = 0
-        tax_total = 0
-        for line in bill.lines.filter(is_deleted=False).select_related("account", "tax_rate"):
-            base_amount = line.subtotal()
-            if base_amount > 0:
-                JournalEntryLine.objects.create(
-                    journal_entry=je,
-                    account=line.account,
-                    description=f"Bill {bill.bill_number} - {line.description}",
-                    debit=base_amount,
-                    credit=0,
-                    line_order=order,
-                    creator=user,
-                )
-                order += 1
-
-            line_tax = line.tax_amount()
-            tax_total += line_tax
-
-        if tax_total > 0:
-            if not vat_account:
-                raise ValueError("VAT Receivable account (code 116) required for taxable bill lines.")
-            JournalEntryLine.objects.create(
-                journal_entry=je,
-                account=vat_account,
-                description=f"VAT on Bill {bill.bill_number}",
-                debit=tax_total,
-                credit=0,
-                line_order=order,
-                creator=user,
-            )
-            order += 1
-
-        JournalEntryLine.objects.create(
-            journal_entry=je,
-            account=payable_account,
-            description=f"Accounts Payable - Bill {bill.bill_number}",
-            debit=0,
-            credit=bill.total_amount,
-            line_order=order,
-            creator=user,
-        )
-
-        je.post()
-        bill.journal_entry = je
-        bill.save(update_fields=["journal_entry", "updated_at"])
-
+        response = Response(BillSerializer(bill).data, status=status.HTTP_200_OK)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 class SupplierPaymentPagination(PageNumberPagination):
     page_size = 20
@@ -373,7 +351,7 @@ class SupplierPaymentListCreateAPI(APIView):
     POST /purchases/supplier-payments/
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanPostPurchases]
     pagination_class = SupplierPaymentPagination
 
     def get(self, request):
@@ -397,54 +375,51 @@ class SupplierPaymentListCreateAPI(APIView):
         return paginator.get_paginated_response(SupplierPaymentSerializer(page, many=True).data)
 
     def post(self, request):
+        rec, early = begin_idempotent(request, scope="purchases.supplier_payment.create")
+        if early:
+            return early
+
         serializer = SupplierPaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         allocations = request.data.get("allocations", [])
 
+        if maker_checker_enabled("purchases.supplier_payment.create"):
+            payload = json.loads(json.dumps(request.data, default=str))
+            approval = create_approval_request(
+                scope="purchases.supplier_payment.create",
+                object_type="purchases.SupplierPayment.create",
+                object_id=uuid.uuid4(),
+                payload=payload,
+                requested_by=request.user,
+            )
+            response = Response(
+                {"message": "Approval required.", "approval_id": str(approval.id), "status": approval.status},
+                status=status.HTTP_202_ACCEPTED,
+            )
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
+
         try:
             with transaction.atomic():
                 payment = serializer.save(creator=request.user)
-                self._replace_allocations(payment, allocations, user=request.user)
+                apply_supplier_payment_allocations(payment, allocations, user=request.user)
+                je = post_supplier_payment_journal(payment=payment, user=request.user)
+                payment.journal_entry = je
+                payment.save(update_fields=["journal_entry", "updated_at"])
                 payment.refresh_from_db()
         except ValueError as exc:
-            return Response(
-                {"error": "VALIDATION_ERROR", "message": str(exc)},
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
-        return Response(SupplierPaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+        response = Response(SupplierPaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
     def _replace_allocations(self, payment: SupplierPayment, allocations, user):
-        total_applied = Decimal("0")
-        if payment.payment_type == "advance_payment":
-            allocations = []
-
-        for row in allocations:
-            bill_id = row.get("bill")
-            amount = Decimal(str(row.get("amount", "0")))
-            if amount <= 0:
-                continue
-            bill = Bill.objects.filter(pk=bill_id, is_deleted=False).first()
-            if not bill:
-                raise ValueError(f"Invalid bill: {bill_id}")
-            if bill.supplier_id != payment.supplier_id:
-                raise ValueError("Bill supplier must match payment supplier.")
-            if bill.status != "posted":
-                raise ValueError(f"Bill {bill.bill_number} must be posted before payment.")
-            if amount > bill.balance_amount:
-                raise ValueError(f"Applied amount exceeds current bill balance for {bill.bill_number}.")
-
-            SupplierPaymentAllocation.objects.create(
-                payment=payment,
-                bill=bill,
-                amount=amount,
-                creator=user,
-            )
-            bill.paid_amount = (bill.paid_amount or Decimal("0")) + amount
-            bill.save(update_fields=["paid_amount", "updated_at"])
-            total_applied += amount
-
-        if total_applied > payment.amount_paid:
-            raise ValueError("Total applied amount cannot exceed amount_paid.")
+        apply_supplier_payment_allocations(payment, allocations, user)
 
 
 class SupplierPaymentDetailAPI(APIView):
@@ -452,7 +427,7 @@ class SupplierPaymentDetailAPI(APIView):
     GET/PATCH/DELETE /purchases/supplier-payments/<uuid>/
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CanPostPurchases]
 
     def get(self, request, pk):
         payment = _get_payment(pk)
@@ -461,39 +436,77 @@ class SupplierPaymentDetailAPI(APIView):
         return Response(SupplierPaymentSerializer(payment).data)
 
     def patch(self, request, pk):
-        payment = _get_payment(pk)
-        if not payment:
-            return Response({"error": "NOT_FOUND", "message": "Supplier payment not found."}, status=404)
-        serializer = SupplierPaymentSerializer(payment, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
+        rec, early = begin_idempotent(request, scope="purchases.supplier_payment.update")
+        if early:
+            return early
+
         allocations = request.data.get("allocations", None)
         try:
             with transaction.atomic():
+                payment = SupplierPayment.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+                if not payment:
+                    return finalize_idempotent_failure(
+                        rec, error="NOT_FOUND", message="Supplier payment not found.", http_status=404  # type: ignore[arg-type]
+                    )
+                if payment.is_posted:
+                    return finalize_idempotent_failure(
+                        rec,  # type: ignore[arg-type]
+                        error="PAYMENT_POSTED",
+                        message="Posted payment cannot be edited.",
+                        http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+
+                serializer = SupplierPaymentSerializer(payment, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
                 self._rollback_allocations(payment)
                 payment = serializer.save(updator=request.user)
                 if allocations is not None:
                     self._replace_allocations(payment, allocations, user=request.user)
                 payment.refresh_from_db()
         except ValueError as exc:
-            return Response(
-                {"error": "VALIDATION_ERROR", "message": str(exc)},
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
-        return Response(SupplierPaymentSerializer(payment).data)
+        response = Response(SupplierPaymentSerializer(payment).data)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
     def delete(self, request, pk):
-        payment = _get_payment(pk)
-        if not payment:
-            return Response({"error": "NOT_FOUND", "message": "Supplier payment not found."}, status=404)
+        rec, early = begin_idempotent(request, scope="purchases.supplier_payment.delete")
+        if early:
+            return early
+
         with transaction.atomic():
+            payment = SupplierPayment.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+            if not payment:
+                return finalize_idempotent_failure(
+                    rec, error="NOT_FOUND", message="Supplier payment not found.", http_status=404  # type: ignore[arg-type]
+                )
+            if payment.is_posted:
+                return finalize_idempotent_failure(
+                    rec,  # type: ignore[arg-type]
+                    error="PAYMENT_POSTED",
+                    message="Posted payment cannot be deleted.",
+                    http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
             self._rollback_allocations(payment)
             payment.is_deleted = True
             payment.save(update_fields=["is_deleted", "updated_at"])
-        return Response(status=status.HTTP_204_NO_CONTENT)
+
+        response = Response(status=status.HTTP_204_NO_CONTENT)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
     def _rollback_allocations(self, payment: SupplierPayment):
         for allocation in payment.allocations.filter(is_deleted=False).select_related("bill"):
-            bill = allocation.bill
+            bill = Bill.objects.select_for_update().get(pk=allocation.bill_id)
+            applied_total = bill.payment_allocations.filter(is_deleted=False).aggregate(total=Sum("amount")).get("total")
+            applied_total = (applied_total or Decimal("0")).quantize(Decimal("0.01"))
+            if (bill.paid_amount or Decimal("0")).quantize(Decimal("0.01")) != applied_total:
+                raise ValueError(f"DRIFT_DETECTED: bill {bill.bill_number} paid_amount is out of sync with allocations.")
             bill.paid_amount = (bill.paid_amount or Decimal("0")) - allocation.amount
             if bill.paid_amount < 0:
                 bill.paid_amount = Decimal("0")

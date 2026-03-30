@@ -214,3 +214,16 @@ class JournalEntryInsufficientLinesException(AccountError):
             ),
             line_count=line_count,
         )
+
+
+class JournalEntryPostingForbidden(AccountError):
+    """Raised when JournalEntry.post() is called outside an approved posting gate."""
+
+    def __init__(self):
+        super().__init__(
+            code="JOURNAL_POST_GATE",
+            message=(
+                "Direct journal posting is disabled. Use accounting.services.posting, "
+                "AccountingEngine.post_journal_entry(), or accounting.journal_post_gate.permit_journal_post()."
+            ),
+        )

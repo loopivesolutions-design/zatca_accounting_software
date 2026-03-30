@@ -20,6 +20,8 @@ from .tax_views import (
     TaxRateDetailAPI,
     TaxRateChoicesAPI,
 )
+from .report_views import StatementOfAccountAPI, ProfitAndLossAPI, GeneralLedgerAPI
+from .period_views import AccountingPeriodListCreateAPI, AccountingPeriodCloseAPI
 
 app_name = "accounting"
 
@@ -87,4 +89,14 @@ urlpatterns = [
 
     # Retrieve / update / delete
     path("tax-rates/<uuid:pk>/", TaxRateDetailAPI.as_view(), name="tax-rate-detail"),
+
+    # ── Reports ───────────────────────────────────────────────────────────────
+    path("reports/statement-of-account/", StatementOfAccountAPI.as_view(), name="statement-of-account"),
+    path("reports/profit-and-loss/", ProfitAndLossAPI.as_view(), name="profit-and-loss"),
+    path("reports/general-ledger/", GeneralLedgerAPI.as_view(), name="general-ledger"),
+
+    # ── Periods / Close Control ───────────────────────────────────────────────
+    path("periods/", AccountingPeriodListCreateAPI.as_view(), name="period-list-create"),
+    path("periods/<uuid:pk>/close/", AccountingPeriodCloseAPI.as_view(), {"action": "close"}, name="period-close"),
+    path("periods/<uuid:pk>/reopen/", AccountingPeriodCloseAPI.as_view(), {"action": "reopen"}, name="period-reopen"),
 ]

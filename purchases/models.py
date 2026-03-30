@@ -1,10 +1,12 @@
 from decimal import Decimal
 
 from django.db import models
+from django.db.models import F, Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from main.models import BaseModel
+from main.money import get_vat_rounding_strategy, money, vat_amount
 
 
 PAYMENT_TERMS_CHOICES = (
@@ -128,6 +130,13 @@ class Bill(BaseModel):
     """
 
     bill_number = models.CharField(_("Bill Number"), max_length=30, unique=True, db_index=True)
+    external_reference = models.CharField(
+        _("External Reference"),
+        max_length=100,
+        blank=True,
+        db_index=True,
+        help_text=_("Client/system reference for idempotent business deduplication."),
+    )
     supplier = models.ForeignKey(
         "purchases.Supplier",
         on_delete=models.PROTECT,
@@ -163,6 +172,21 @@ class Bill(BaseModel):
     class Meta:
         db_table = "purchase_bill"
         ordering = ["-bill_date", "-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=~models.Q(status="posted") | models.Q(journal_entry__isnull=False),
+                name="bill_posted_requires_journal_entry",
+            ),
+            models.CheckConstraint(
+                check=Q(paid_amount__gte=0) & Q(paid_amount__lte=F("total_amount")),
+                name="bill_paid_lte_total_nonneg",
+            ),
+            models.UniqueConstraint(
+                fields=["supplier", "external_reference"],
+                condition=~models.Q(external_reference=""),
+                name="uniq_bill_supplier_external_reference",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.bill_number
@@ -177,13 +201,14 @@ class Bill(BaseModel):
         subtotal = Decimal("0")
         total_vat = Decimal("0")
         total_amount = Decimal("0")
+        strategy = get_vat_rounding_strategy()
         for line in lines:
             subtotal += line.subtotal()
-            total_vat += line.tax_amount()
-            total_amount += line.total()
-        self.subtotal = subtotal
-        self.total_vat = total_vat
-        self.total_amount = total_amount
+            total_vat += line.tax_amount(strategy=strategy)
+            total_amount += line.total(strategy=strategy)
+        self.subtotal = money(subtotal)
+        self.total_vat = money(total_vat) if strategy == "invoice" else money(total_vat)
+        self.total_amount = money(total_amount) if strategy == "invoice" else money(total_amount)
         self.save(update_fields=["subtotal", "total_vat", "total_amount", "updated_at"])
 
     def mark_posted(self, *, user=None) -> None:
@@ -235,15 +260,17 @@ class BillLine(BaseModel):
     def subtotal(self) -> Decimal:
         gross = (self.quantity or Decimal("0")) * (self.unit_price or Decimal("0"))
         discount = (gross * (self.discount_percent or Decimal("0"))) / Decimal("100")
-        return gross - discount
+        return money(gross - discount)
 
-    def tax_amount(self) -> Decimal:
+    def tax_amount(self, *, strategy: str | None = None) -> Decimal:
         if not self.tax_rate:
             return Decimal("0")
-        return (self.subtotal() * self.tax_rate.rate) / Decimal("100")
+        return vat_amount(self.subtotal(), self.tax_rate.rate, strategy=strategy)
 
-    def total(self) -> Decimal:
-        return self.subtotal() + self.tax_amount()
+    def total(self, *, strategy: str | None = None) -> Decimal:
+        strat = (strategy or get_vat_rounding_strategy()).strip().lower()
+        vat = self.tax_amount(strategy=strat)
+        return money(self.subtotal() + (money(vat) if strat == "invoice" else vat))
 
 
 class SupplierPayment(BaseModel):
@@ -272,6 +299,14 @@ class SupplierPayment(BaseModel):
     payment_date = models.DateField(_("Payment Date"), db_index=True)
     description = models.TextField(_("Description"), blank=True)
     is_posted = models.BooleanField(_("Posted"), default=True, db_index=True)
+    journal_entry = models.OneToOneField(
+        "accounting.JournalEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_supplier_payment",
+        verbose_name=_("Journal Entry"),
+    )
 
     class Meta:
         db_table = "supplier_payment"
@@ -353,13 +388,14 @@ class DebitNote(BaseModel):
         subtotal = Decimal("0")
         total_vat = Decimal("0")
         total_amount = Decimal("0")
+        strategy = get_vat_rounding_strategy()
         for line in lines:
             subtotal += line.subtotal()
-            total_vat += line.tax_amount()
-            total_amount += line.total()
-        self.subtotal = subtotal
-        self.total_vat = total_vat
-        self.total_amount = total_amount
+            total_vat += line.tax_amount(strategy=strategy)
+            total_amount += line.total(strategy=strategy)
+        self.subtotal = money(subtotal)
+        self.total_vat = money(total_vat) if strategy == "invoice" else money(total_vat)
+        self.total_amount = money(total_amount) if strategy == "invoice" else money(total_amount)
         self.save(update_fields=["subtotal", "total_vat", "total_amount", "updated_at"])
 
     def mark_posted(self, *, user=None) -> None:
@@ -403,12 +439,14 @@ class DebitNoteLine(BaseModel):
     def subtotal(self) -> Decimal:
         gross = (self.quantity or Decimal("0")) * (self.unit_price or Decimal("0"))
         discount = (gross * (self.discount_percent or Decimal("0"))) / Decimal("100")
-        return gross - discount
+        return money(gross - discount)
 
-    def tax_amount(self) -> Decimal:
+    def tax_amount(self, *, strategy: str | None = None) -> Decimal:
         if not self.tax_rate:
             return Decimal("0")
-        return (self.subtotal() * self.tax_rate.rate) / Decimal("100")
+        return vat_amount(self.subtotal(), self.tax_rate.rate, strategy=strategy)
 
-    def total(self) -> Decimal:
-        return self.subtotal() + self.tax_amount()
+    def total(self, *, strategy: str | None = None) -> Decimal:
+        strat = (strategy or get_vat_rounding_strategy()).strip().lower()
+        vat = self.tax_amount(strategy=strat)
+        return money(self.subtotal() + (money(vat) if strat == "invoice" else vat))

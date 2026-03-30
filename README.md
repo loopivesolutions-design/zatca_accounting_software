@@ -75,6 +75,10 @@ zatca_accounting_software/
 │   ├── urls.py
 │   └── views.py
 │
+├── zatca_adapter/               # ZATCA adapter (XML/sign/submit/validate) — accounting-agnostic
+│   ├── __init__.py
+│   └── services.py
+│
 ├── zatca_accounting_software/   # Project config
 │   ├── settings.py
 │   ├── urls.py
@@ -101,8 +105,7 @@ venv\Scripts\activate           # Windows
 ### 3.2 Install dependencies
 
 ```bash
-pip install django djangorestframework djangorestframework-simplejwt \
-            django-cors-headers python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 3.3 Configure `.env`
@@ -135,6 +138,36 @@ BACKEND_URL=http://127.0.0.1:8000
 
 # ── CORS (comma-separated list of allowed frontend origins) ───────────────────
 CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+
+# ── ZATCA (Phase 2) — live submission transport ───────────────────────────────
+ZATCA_API_BASE_URL=
+ZATCA_API_TOKEN=
+# When unset: True if DEBUG=True (simulate API), False if DEBUG=False (live API). Set true/false to override.
+ZATCA_SIMULATION_MODE=
+
+# ── ZATCA signing keys/certificates ───────────────────────────────────────────
+# Private key is stored on disk, not in DB. Use secure permissions (0600).
+ZATCA_PRIVATE_KEY_PATH=
+
+# ── ZATCA UBL 2.1 + profile validation gate (absolute XSD paths) ─────────────
+# If these are set, live submission enforces XSD validation for SIGNED XML.
+ZATCA_UBL_INVOICE_XSD_PATH=
+ZATCA_UBL_CREDIT_NOTE_XSD_PATH=
+# Optional comma-separated extra XSD(s) (ZATCA profile overlays)
+ZATCA_PROFILE_XSD_PATHS=
+
+# ── Maker–Checker (approval workflow) ─────────────────────────────────────────
+# If enabled, sensitive actions require approval (User A requests → User B approves).
+MAKER_CHECKER_ENABLED=false
+# Optional per-scope overrides (examples):
+# MAKER_CHECKER_SALES_INVOICE_POST=true
+# MAKER_CHECKER_ACCOUNTING_JOURNAL_ENTRY_REVERSE=true
+# MAKER_CHECKER_ACCOUNTING_PERIOD_REOPEN=true
+
+# ── VAT rounding strategy (lock globally) ─────────────────────────────────────
+# "line" = round VAT per line then sum (recommended; default)
+# "invoice" = sum VAT then round at invoice totals
+VAT_ROUNDING_STRATEGY=line
 ```
 
 > **Gmail:** Use an [App Password](https://myaccount.google.com/apppasswords) — not your regular Gmail password.
@@ -410,6 +443,52 @@ This will create a minimal `Admin` role (only if none exist) and then seed its p
 
 ---
 
+### 5.4 `generate_zatca_csr`
+
+Generates a **private key** and **CSR** (OpenSSL) for ZATCA onboarding.
+
+```bash
+python manage.py generate_zatca_csr --out-dir /secure/zatca --name prod --cn "Your Company"
+```
+
+Notes:
+- The private key is written with **0600** permissions.
+- Submit the CSR during ZATCA onboarding to obtain a certificate.
+
+---
+
+### 5.5 `activate_zatca_certificate`
+
+Marks a certificate as the active one used for signing (rotation supported).
+
+```bash
+python manage.py activate_zatca_certificate --name prod --private-key-path /secure/zatca/prod.key.pem
+```
+
+---
+
+### 5.6 `process_zatca_outbox`
+
+Processes queued ZATCA submissions (outbox worker with retry/backoff/dead-letter).
+
+```bash
+python manage.py process_zatca_outbox
+```
+
+---
+
+### 5.7 `export_zatca_evidence_package`
+
+Exports an auditor-ready evidence package to disk for an invoice/credit note:
+
+```bash
+python manage.py export_zatca_evidence_package --document-type invoice --id <invoice-uuid> --out-dir /tmp/zatca-evidence --zip
+```
+
+Package contains: original payload, canonical XML, signed XML, hash, QR, ZATCA response, timestamps, and certificate metadata.
+
+---
+
 ## 6. Migration Reset (Clean Start)
 
 Use this when you need a completely fresh database:
@@ -463,6 +542,16 @@ Full documentation with request bodies and response examples is in [`API_DOCUMEN
 ```
 Authorization: Bearer <access_token>
 ```
+
+### Financial Mutation Idempotency (Critical)
+
+All endpoints that mutate financial state (posting, payments, adjustments, journal actions) require:
+
+```
+Idempotency-Key: <unique-string>
+```
+
+Replays with the same key return the previous response. Re-using the same key with a different payload returns `409 IDEMPOTENCY_CONFLICT`.
 
 
 Pro Tip for Cursor Development

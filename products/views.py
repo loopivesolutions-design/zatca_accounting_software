@@ -26,6 +26,11 @@ from rest_framework.views import APIView
 from decimal import Decimal
 
 from main.pagination import CustomPagination
+from main.idempotency import begin_idempotent, finalize_idempotent_failure, finalize_idempotent_success
+from main.models import BulkExecutionItem
+from main.approvals import create_approval_request, maker_checker_enabled
+from main.allocation_validator import AllocationValidator
+from accounting.models import AccountingPeriod
 
 from .models import (
     ProductCategory,
@@ -35,6 +40,7 @@ from .models import (
     InventoryAdjustment,
     InventoryAdjustmentLine,
 )
+from .inventory_posting import InventoryAdjustmentPostAbort, execute_inventory_adjustment_post
 from .serializers import (
     ProductCategorySerializer,
     ProductCategoryTreeSerializer,
@@ -248,22 +254,35 @@ class WarehouseBulkAPI(APIView):
     VALID_ACTIONS = {"delete", "duplicate"}
 
     def post(self, request):
+        rec, early = begin_idempotent(request, scope="products.warehouse.bulk")
+        if early:
+            return early
+
         action = str(request.data.get("action", "")).strip()
         ids = request.data.get("ids", [])
+        batch_id = str(request.data.get("batch_id") or request.headers.get("Idempotency-Key") or "").strip()
 
         if action not in self.VALID_ACTIONS:
-            return Response(
-                {
-                    "error": "INVALID_ACTION",
-                    "message": f"Invalid action '{action}'. Must be one of: delete, duplicate.",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="INVALID_ACTION",
+                message=f"Invalid action '{action}'. Must be one of: delete, duplicate.",
+                http_status=status.HTTP_400_BAD_REQUEST,
             )
 
         if not ids or not isinstance(ids, list):
-            return Response(
-                {"error": "IDS_REQUIRED", "message": "'ids' must be a non-empty list of UUIDs."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="IDS_REQUIRED",
+                message="'ids' must be a non-empty list of UUIDs.",
+                http_status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not batch_id:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="BATCH_ID_REQUIRED",
+                message="'batch_id' is required for bulk item-level idempotency.",
+                http_status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Validate UUIDs
@@ -272,9 +291,11 @@ class WarehouseBulkAPI(APIView):
             try:
                 valid_uuids.append(uuid_lib.UUID(str(raw)))
             except (ValueError, AttributeError):
-                return Response(
-                    {"error": "INVALID_ID", "message": f"'{raw}' is not a valid UUID."},
-                    status=status.HTTP_400_BAD_REQUEST,
+                return finalize_idempotent_failure(
+                    rec,  # type: ignore[arg-type]
+                    error="INVALID_ID",
+                    message=f"'{raw}' is not a valid UUID.",
+                    http_status=status.HTTP_400_BAD_REQUEST,
                 )
 
         qs = Warehouse.objects.filter(pk__in=valid_uuids, is_deleted=False)
@@ -285,6 +306,14 @@ class WarehouseBulkAPI(APIView):
             deleted = 0
             skipped = []
             for wh in qs:
+                item, created = BulkExecutionItem.objects.get_or_create(
+                    scope="products.warehouse.bulk.delete",
+                    batch_id=batch_id,
+                    item_key=str(wh.id),
+                    defaults={"state": "processing", "response_body": {}},
+                )
+                if not created and item.state == "succeeded":
+                    continue
                 if wh.has_transactions():
                     skipped.append(
                         {
@@ -294,11 +323,17 @@ class WarehouseBulkAPI(APIView):
                             "reason": "WAREHOUSE_LOCKED",
                         }
                     )
+                    item.state = "succeeded"
+                    item.response_body = {"status": "skipped", "reason": "WAREHOUSE_LOCKED"}
+                    item.save(update_fields=["state", "response_body", "updated_at"])
                     continue
                 wh.is_deleted = True
                 wh.save(update_fields=["is_deleted", "updated_at"])
+                item.state = "succeeded"
+                item.response_body = {"status": "deleted"}
+                item.save(update_fields=["state", "response_body", "updated_at"])
                 deleted += 1
-            return Response(
+            response = Response(
                 {
                     "message": f"{deleted} warehouse(s) deleted" + (f", {len(skipped)} skipped." if skipped else "."),
                     "deleted": deleted,
@@ -306,11 +341,21 @@ class WarehouseBulkAPI(APIView):
                     "not_found": not_found,
                 }
             )
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
 
         # duplicate
         created = []
         with transaction.atomic():
             for wh in qs:
+                item, item_created = BulkExecutionItem.objects.get_or_create(
+                    scope="products.warehouse.bulk.duplicate",
+                    batch_id=batch_id,
+                    item_key=str(wh.id),
+                    defaults={"state": "processing", "response_body": {}},
+                )
+                if not item_created and item.state == "succeeded":
+                    continue
                 # Ensure unique code for copy
                 base_code = f"{wh.code}-COPY"
                 new_code = base_code
@@ -336,11 +381,16 @@ class WarehouseBulkAPI(APIView):
                     creator=request.user,
                 )
                 created.append({"id": str(copy.id), "code": copy.code, "name": copy.name, "copied_from": str(wh.id)})
+                item.state = "succeeded"
+                item.response_body = {"status": "duplicated", "new_id": str(copy.id)}
+                item.save(update_fields=["state", "response_body", "updated_at"])
 
-        return Response(
+        response = Response(
             {"message": f"{len(created)} warehouse(s) duplicated.", "created": len(created), "warehouses": created},
             status=status.HTTP_201_CREATED,
         )
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -765,126 +815,83 @@ class InventoryAdjustmentPostAPI(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
+        rec, early = begin_idempotent(request, scope="products.inventory_adjustment.post")
+        if early:
+            return early
+
         try:
             adj = InventoryAdjustment.objects.select_related("warehouse").get(pk=pk, is_deleted=False)
         except InventoryAdjustment.DoesNotExist:
-            return _inventory_not_found()
+            resp = _inventory_not_found()
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error=resp.data.get("error", "NOT_FOUND"),
+                message=resp.data.get("message", "Not found."),
+                http_status=resp.status_code,
+            )
 
         if adj.status == "posted":
-            return Response({"error": "ADJUSTMENT_ALREADY_POSTED", "message": "Already posted."}, status=422)
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="ADJUSTMENT_ALREADY_POSTED",
+                message="Already posted.",
+                http_status=422,
+            )
 
         lines = list(
             adj.lines.filter(is_deleted=False).select_related("product", "account", "product__inventory_account")
         )
-        if not lines:
-            return Response({"error": "NO_LINES", "message": "Add at least one line before posting."}, status=400)
-
-        # Validate required fields per line
-        for line in lines:
-            if line.quantity_delta == 0:
-                return Response({"error": "QTY_REQUIRED", "message": "Qty +/- cannot be 0."}, status=400)
-            if line.inventory_value_delta == 0:
-                return Response({"error": "VALUE_REQUIRED", "message": "Inventory value +/- cannot be 0."}, status=400)
-            if not line.product.inventory_account_id:
-                return Response(
-                    {
-                        "error": "MISSING_INVENTORY_ACCOUNT",
-                        "message": f"Item '{line.product.name}' must have an Inventory Asset Account to post adjustments.",
-                    },
-                    status=422,
-                )
-
-        from accounting.models import JournalEntry, JournalEntryLine
-
-        with transaction.atomic():
-            # Create journal entry draft
-            je = JournalEntry.objects.create(
-                date=adj.date,
-                description=f"Inventory adjustment {adj.reference or str(adj.pk)[:8]}",
-                status="draft",
-                creator=request.user,
+        try:
+            AllocationValidator.validate_inventory_adjustment_postable(adj, lines)
+        except ValueError as exc:
+            msg = str(exc)
+            if "closed accounting period" in msg:
+                code, st = "PERIOD_CLOSED", 422
+            elif "Add at least one line" in msg:
+                code, st = "NO_LINES", 400
+            elif "Qty +/-" in msg:
+                code, st = "QTY_REQUIRED", 400
+            elif "Inventory value +/-" in msg:
+                code, st = "VALUE_REQUIRED", 400
+            elif "Inventory Asset Account" in msg:
+                code, st = "MISSING_INVENTORY_ACCOUNT", 422
+            else:
+                code, st = "VALIDATION_ERROR", 422
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error=code,
+                message=msg,
+                http_status=st,
             )
 
-            # Build JE lines
-            order = 0
-            for line in lines:
-                amount = Decimal(line.inventory_value_delta)
-                inv_account = line.product.inventory_account
-                offset_account = line.account
+        if maker_checker_enabled("products.inventory_adjustment.post"):
+            approval = create_approval_request(
+                scope="products.inventory_adjustment.post",
+                object_type="products.InventoryAdjustment",
+                object_id=adj.id,
+                payload={},
+                requested_by=request.user,
+            )
+            response = Response(
+                {"message": "Approval required.", "approval_id": str(approval.id), "status": approval.status},
+                status=status.HTTP_202_ACCEPTED,
+            )
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
 
-                if amount > 0:
-                    # Increase inventory: Dr Inventory, Cr Offset
-                    JournalEntryLine.objects.create(
-                        journal_entry=je,
-                        account=inv_account,
-                        description=f"Inventory increase - {line.product.name}",
-                        debit=amount,
-                        credit=Decimal("0"),
-                        line_order=order,
-                        creator=request.user,
-                    )
-                    order += 1
-                    JournalEntryLine.objects.create(
-                        journal_entry=je,
-                        account=offset_account,
-                        description=f"Offset - {line.product.name}",
-                        debit=Decimal("0"),
-                        credit=amount,
-                        line_order=order,
-                        creator=request.user,
-                    )
-                    order += 1
-                else:
-                    # Decrease inventory: Cr Inventory, Dr Offset
-                    amount_abs = abs(amount)
-                    JournalEntryLine.objects.create(
-                        journal_entry=je,
-                        account=offset_account,
-                        description=f"Offset - {line.product.name}",
-                        debit=amount_abs,
-                        credit=Decimal("0"),
-                        line_order=order,
-                        creator=request.user,
-                    )
-                    order += 1
-                    JournalEntryLine.objects.create(
-                        journal_entry=je,
-                        account=inv_account,
-                        description=f"Inventory decrease - {line.product.name}",
-                        debit=Decimal("0"),
-                        credit=amount_abs,
-                        line_order=order,
-                        creator=request.user,
-                    )
-                    order += 1
+        try:
+            adj = execute_inventory_adjustment_post(adjustment_id=pk, user=request.user)
+        except InventoryAdjustmentPostAbort as exc:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error=exc.code,
+                message=str(exc),
+                http_status=exc.http_status,
+            )
 
-                # Update stock quantity and avg cost
-                product = line.product
-                old_qty = Decimal(product.stock_quantity or 0)
-                old_cost = Decimal(product.avg_unit_cost or 0) or Decimal(product.purchase_price or 0)
-                delta_qty = Decimal(line.quantity_delta)
-                new_qty = old_qty + delta_qty
-
-                if delta_qty > 0 and amount > 0 and new_qty > 0:
-                    # Weighted average
-                    new_cost = ((old_qty * old_cost) + amount) / new_qty
-                    product.avg_unit_cost = new_cost.quantize(Decimal("0.01"))
-
-                product.stock_quantity = new_qty
-                product.save(update_fields=["stock_quantity", "avg_unit_cost", "updated_at"])
-
-            # Post JE (validates balanced + sequential ref)
-            je.post()
-
-            # Mark adjustment posted + assign adjustment_id
-            adj.adjustment_id = adj._next_adjustment_id()
-            adj.status = "posted"
-            adj.posted_at = timezone.now()
-            adj.journal_entry = je
-            adj.updator = request.user
-            adj.save(update_fields=["adjustment_id", "status", "posted_at", "journal_entry", "updated_at", "updator_id"])
-
-        return Response(InventoryAdjustmentSerializer(adj).data, status=200)
+        response = Response(InventoryAdjustmentSerializer(adj).data, status=200)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -917,25 +924,37 @@ class ProductCategoryBulkAPI(APIView):
     VALID_ACTIONS = {"set_status", "delete", "duplicate"}
 
     def post(self, request):
+        rec, early = begin_idempotent(request, scope="products.category.bulk")
+        if early:
+            return early
+
         action = request.data.get("action", "").strip()
         ids = request.data.get("ids", [])
+        batch_id = str(request.data.get("batch_id") or request.headers.get("Idempotency-Key") or "").strip()
 
         # ── Validate action ──────────────────────────────────────────────────
         if action not in self.VALID_ACTIONS:
-            return Response(
-                {
-                    "error": "INVALID_ACTION",
-                    "message": f"Invalid action '{action}'. "
-                               f"Must be one of: {', '.join(sorted(self.VALID_ACTIONS))}.",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="INVALID_ACTION",
+                message=f"Invalid action '{action}'. Must be one of: {', '.join(sorted(self.VALID_ACTIONS))}.",
+                http_status=status.HTTP_400_BAD_REQUEST,
             )
 
         # ── Validate ids ─────────────────────────────────────────────────────
         if not ids or not isinstance(ids, list):
-            return Response(
-                {"error": "IDS_REQUIRED", "message": "'ids' must be a non-empty list of UUIDs."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="IDS_REQUIRED",
+                message="'ids' must be a non-empty list of UUIDs.",
+                http_status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not batch_id:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="BATCH_ID_REQUIRED",
+                message="'batch_id' is required for bulk item-level idempotency.",
+                http_status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Validate each id is a proper UUID string
@@ -944,9 +963,11 @@ class ProductCategoryBulkAPI(APIView):
             try:
                 valid_uuids.append(uuid_lib.UUID(str(raw)))
             except (ValueError, AttributeError):
-                return Response(
-                    {"error": "INVALID_ID", "message": f"'{raw}' is not a valid UUID."},
-                    status=status.HTTP_400_BAD_REQUEST,
+                return finalize_idempotent_failure(
+                    rec,  # type: ignore[arg-type]
+                    error="INVALID_ID",
+                    message=f"'{raw}' is not a valid UUID.",
+                    http_status=status.HTTP_400_BAD_REQUEST,
                 )
 
         categories = ProductCategory.objects.filter(pk__in=valid_uuids, is_deleted=False)
@@ -955,11 +976,17 @@ class ProductCategoryBulkAPI(APIView):
 
         # ── Dispatch ─────────────────────────────────────────────────────────
         if action == "set_status":
-            return self._set_status(request, categories)
+            response = self._set_status(request, categories)
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
         if action == "delete":
-            return self._delete(request, categories, not_found)
+            response = self._delete(request, categories, not_found, batch_id=batch_id)
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
         if action == "duplicate":
-            return self._duplicate(request, categories)
+            response = self._duplicate(request, categories, batch_id=batch_id)
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
 
     # ── set_status ────────────────────────────────────────────────────────────
 
@@ -986,13 +1013,22 @@ class ProductCategoryBulkAPI(APIView):
 
     # ── delete ────────────────────────────────────────────────────────────────
 
-    def _delete(self, request, categories, not_found):
+    def _delete(self, request, categories, not_found, *, batch_id: str):
         deleted = []
         skipped = []
 
         annotated = _annotate_product_count(categories)
 
         for cat in annotated:
+            item, created = BulkExecutionItem.objects.get_or_create(
+                scope="products.category.bulk.delete",
+                batch_id=batch_id,
+                item_key=str(cat.id),
+                defaults={"state": "processing", "response_body": {}},
+            )
+            if not created and item.state == "succeeded":
+                deleted.append(str(cat.id))
+                continue
             child_count = cat.children.filter(is_deleted=False).count()
             if child_count > 0:
                 skipped.append({
@@ -1001,6 +1037,9 @@ class ProductCategoryBulkAPI(APIView):
                     "reason": "CATEGORY_HAS_CHILDREN",
                     "detail": f"Has {child_count} sub-categor{'y' if child_count == 1 else 'ies'}.",
                 })
+                item.state = "succeeded"
+                item.response_body = {"status": "skipped", "reason": "CATEGORY_HAS_CHILDREN"}
+                item.save(update_fields=["state", "response_body", "updated_at"])
                 continue
 
             product_count = getattr(cat, "product_count", 0)
@@ -1011,11 +1050,17 @@ class ProductCategoryBulkAPI(APIView):
                     "reason": "CATEGORY_HAS_PRODUCTS",
                     "detail": f"Has {product_count} product{'s' if product_count != 1 else ''} assigned.",
                 })
+                item.state = "succeeded"
+                item.response_body = {"status": "skipped", "reason": "CATEGORY_HAS_PRODUCTS"}
+                item.save(update_fields=["state", "response_body", "updated_at"])
                 continue
 
             cat.is_deleted = True
             cat.save(update_fields=["is_deleted", "updated_at"])
             deleted.append(str(cat.id))
+            item.state = "succeeded"
+            item.response_body = {"status": "deleted"}
+            item.save(update_fields=["state", "response_body", "updated_at"])
 
         return Response(
             {
@@ -1031,11 +1076,19 @@ class ProductCategoryBulkAPI(APIView):
 
     # ── duplicate ─────────────────────────────────────────────────────────────
 
-    def _duplicate(self, request, categories):
+    def _duplicate(self, request, categories, *, batch_id: str):
         created = []
 
         with transaction.atomic():
             for cat in categories.select_related("parent"):
+                item, item_created = BulkExecutionItem.objects.get_or_create(
+                    scope="products.category.bulk.duplicate",
+                    batch_id=batch_id,
+                    item_key=str(cat.id),
+                    defaults={"state": "processing", "response_body": {}},
+                )
+                if not item_created and item.state == "succeeded":
+                    continue
                 copy = ProductCategory(
                     name=f"{cat.name} (Copy)",
                     name_ar=cat.name_ar,
@@ -1050,6 +1103,9 @@ class ProductCategoryBulkAPI(APIView):
                     "name": copy.name,
                     "copied_from": str(cat.id),
                 })
+                item.state = "succeeded"
+                item.response_body = {"status": "duplicated", "new_id": str(copy.id)}
+                item.save(update_fields=["state", "response_body", "updated_at"])
 
         return Response(
             {

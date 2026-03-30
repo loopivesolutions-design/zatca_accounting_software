@@ -65,16 +65,109 @@ ZATCA_LOCKED_FIELDS: frozenset = frozenset({
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Transaction source registry
-# Each entry: (app_label, ModelName, account_FK_field_name)
-# Add a row here when a new transaction model is introduced.
+# Each dict: app_label, model_name, account_field (ORM lookup key), filters (AND).
+# Only *posted* commercial / ledger activity counts toward CoA structural locks.
+# Add a row when a new model references Account on posted business documents.
 # ──────────────────────────────────────────────────────────────────────────────
-TRANSACTION_SOURCES = [
-    ("accounting", "JournalEntryLine", "account_id"),
-    # ("invoicing",  "InvoiceLine",      "account_id"),   # add with invoicing app
-    # ("purchase",   "BillLine",         "account_id"),   # add with purchase app
-    # ("banking",    "Payment",          "account_id"),   # add with banking app
-    # ("expenses",   "ExpenseLine",      "account_id"),   # add with expense app
+TRANSACTION_SOURCES: list[dict] = [
+    {
+        "app_label": "accounting",
+        "model_name": "JournalEntryLine",
+        "account_field": "account_id",
+        "filters": {"journal_entry__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "sales",
+        "model_name": "InvoiceLine",
+        "account_field": "account_id",
+        "filters": {"invoice__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "sales",
+        "model_name": "CustomerCreditNoteLine",
+        "account_field": "account_id",
+        "filters": {"credit_note__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "purchases",
+        "model_name": "BillLine",
+        "account_field": "account_id",
+        "filters": {"bill__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "purchases",
+        "model_name": "DebitNoteLine",
+        "account_field": "account_id",
+        "filters": {"debit_note__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "sales",
+        "model_name": "CustomerPayment",
+        "account_field": "paid_through_id",
+        "filters": {"is_posted": True, "journal_entry__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "sales",
+        "model_name": "CustomerRefund",
+        "account_field": "paid_through_id",
+        "filters": {"is_posted": True, "journal_entry__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "purchases",
+        "model_name": "SupplierPayment",
+        "account_field": "paid_through_id",
+        "filters": {"is_posted": True, "journal_entry__status": "posted", "is_deleted": False},
+    },
+    {
+        "app_label": "products",
+        "model_name": "InventoryAdjustmentLine",
+        "account_field": "account_id",
+        "filters": {"adjustment__status": "posted", "is_deleted": False},
+    },
 ]
+
+
+def registered_transaction_source_model_keys() -> set[tuple[str, str]]:
+    return {(spec["app_label"], spec["model_name"]) for spec in TRANSACTION_SOURCES}
+
+
+# Exempt from "FK to Account ⇒ must appear in TRANSACTION_SOURCES":
+# master-data / mapping rows where activity is reflected via JEs or line models, not these FKs alone.
+_ACCOUNT_FK_REGISTRY_EXEMPT_MODELS: frozenset[str] = frozenset({
+    "accounting.Account",
+    "accounting.SystemAccount",
+    "products.Product",
+    "products.Warehouse",
+    "sales.Customer",
+    "purchases.Supplier",
+})
+
+
+def iter_models_with_foreign_key_to_account():
+    """
+    Introspect installed models for ForeignKey/OneToOneField pointing to Account.
+    Pair with TRANSACTION_SOURCES so CoA activity detection cannot miss new document lines.
+    """
+    from django.apps import apps
+    from django.db.models import ForeignKey
+
+    from accounting.models import Account
+
+    for model in apps.get_models():
+        if model._meta.abstract:
+            continue
+        label = f"{model._meta.app_label}.{model.__name__}"
+        if label in _ACCOUNT_FK_REGISTRY_EXEMPT_MODELS:
+            continue
+        if model._meta.app_label.startswith("django."):
+            continue
+        for field in model._meta.get_fields():
+            if not getattr(field, "is_relation", False) or getattr(field, "many_to_many", False):
+                continue
+            if not isinstance(field, ForeignKey):
+                continue
+            if getattr(field, "related_model", None) is Account:
+                yield model._meta.app_label, model.__name__, field.name
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,17 +186,18 @@ class AccountValidator:
     def get_transaction_count(account) -> int:
         """Count all posted transactions that reference this account across all registered sources."""
         from django.apps import apps
+        from django.core.exceptions import FieldError
 
         total = 0
-        for app_label, model_name, field in TRANSACTION_SOURCES:
+        for spec in TRANSACTION_SOURCES:
             try:
-                Model = apps.get_model(app_label, model_name)
-                total += Model.objects.filter(
-                    **{field: account.pk},
-                    journal_entry__status="posted",
-                ).count()
-            except (LookupError, Exception):
-                pass
+                Model = apps.get_model(spec["app_label"], spec["model_name"])
+                flt = {spec["account_field"]: account.pk, **spec["filters"]}
+                total += Model.objects.filter(**flt).count()
+            except LookupError:
+                continue
+            except FieldError:
+                continue
         return total
 
     @classmethod

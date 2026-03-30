@@ -18,6 +18,7 @@ from .models import (
     CustomerRefundAllocation,
     CustomerCreditNote,
     CustomerCreditNoteLine,
+    ZATCA_SUBMISSION_TYPE_CHOICES,
 )
 
 
@@ -290,6 +291,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "invoice_number",
+            "external_reference",
             "customer",
             "customer_name",
             "date",
@@ -300,6 +302,16 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "status_display",
             "posted_at",
             "qr_code_text",
+            "zatca_uuid",
+            "zatca_previous_hash",
+            "zatca_invoice_hash",
+            "zatca_signed_hash",
+            "zatca_submission_status",
+            "zatca_submission_type",
+            "zatca_submission_reference",
+            "zatca_submission_error",
+            "zatca_submitted_at",
+            "zatca_cleared_at",
             "journal_entry",
             "subtotal",
             "total_vat",
@@ -316,6 +328,16 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "status",
             "posted_at",
             "journal_entry",
+            "zatca_uuid",
+            "zatca_previous_hash",
+            "zatca_invoice_hash",
+            "zatca_signed_hash",
+            "zatca_submission_status",
+            "zatca_submission_type",
+            "zatca_submission_reference",
+            "zatca_submission_error",
+            "zatca_submitted_at",
+            "zatca_cleared_at",
             "subtotal",
             "total_vat",
             "total_amount",
@@ -349,6 +371,10 @@ class InvoiceSerializer(serializers.ModelSerializer):
         lines = attrs.get("lines")
         if self.instance is None and (not lines or len(lines) == 0):
             raise serializers.ValidationError({"lines": "At least one invoice line is required."})
+        if self.instance is None and not (attrs.get("external_reference") or "").strip():
+            raise serializers.ValidationError(
+                {"external_reference": "external_reference is required for deduplication safety."}
+            )
         return attrs
 
     def create(self, validated_data):
@@ -395,6 +421,10 @@ class InvoicePostSerializer(serializers.Serializer):
         return attrs
 
 
+class ZatcaSubmitSerializer(serializers.Serializer):
+    submission_type = serializers.ChoiceField(choices=[k for k, _ in ZATCA_SUBMISSION_TYPE_CHOICES])
+
+
 class CustomerPaymentAllocationSerializer(serializers.ModelSerializer):
     invoice_number = serializers.CharField(source="invoice.invoice_number", read_only=True)
     invoice_date = serializers.DateField(source="invoice.date", read_only=True)
@@ -435,6 +465,7 @@ class CustomerPaymentSerializer(serializers.ModelSerializer):
             "payment_date",
             "description",
             "is_posted",
+            "journal_entry",
             "amount_applied",
             "remaining_amount",
             "allocations",
@@ -449,6 +480,7 @@ class CustomerPaymentSerializer(serializers.ModelSerializer):
             "payment_type_display",
             "amount_applied",
             "remaining_amount",
+            "journal_entry",
             "created_at",
             "updated_at",
         ]
@@ -525,6 +557,7 @@ class CustomerCreditNoteSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "credit_note_number",
+            "external_reference",
             "customer",
             "customer_name",
             "date",
@@ -533,6 +566,16 @@ class CustomerCreditNoteSerializer(serializers.ModelSerializer):
             "status",
             "posted_at",
             "qr_code_text",
+            "zatca_uuid",
+            "zatca_previous_hash",
+            "zatca_invoice_hash",
+            "zatca_signed_hash",
+            "zatca_submission_status",
+            "zatca_submission_type",
+            "zatca_submission_reference",
+            "zatca_submission_error",
+            "zatca_submitted_at",
+            "zatca_cleared_at",
             "journal_entry",
             "subtotal",
             "total_vat",
@@ -548,6 +591,16 @@ class CustomerCreditNoteSerializer(serializers.ModelSerializer):
             "id",
             "posted_at",
             "journal_entry",
+            "zatca_uuid",
+            "zatca_previous_hash",
+            "zatca_invoice_hash",
+            "zatca_signed_hash",
+            "zatca_submission_status",
+            "zatca_submission_type",
+            "zatca_submission_reference",
+            "zatca_submission_error",
+            "zatca_submitted_at",
+            "zatca_cleared_at",
             "subtotal",
             "total_vat",
             "total_amount",
@@ -577,6 +630,10 @@ class CustomerCreditNoteSerializer(serializers.ModelSerializer):
         lines = attrs.get("lines")
         if self.instance is None and (not lines or len(lines) == 0):
             raise serializers.ValidationError({"lines": "At least one credit note line is required."})
+        if self.instance is None and not (attrs.get("external_reference") or "").strip():
+            raise serializers.ValidationError(
+                {"external_reference": "external_reference is required for deduplication safety."}
+            )
         return attrs
 
     def create(self, validated_data):
@@ -662,6 +719,7 @@ class CustomerRefundSerializer(serializers.ModelSerializer):
             "refund_date",
             "description",
             "is_posted",
+            "journal_entry",
             "amount_applied",
             "remaining_amount",
             "allocations",
@@ -675,6 +733,7 @@ class CustomerRefundSerializer(serializers.ModelSerializer):
             "paid_through_name",
             "amount_applied",
             "remaining_amount",
+            "journal_entry",
             "created_at",
             "updated_at",
         ]

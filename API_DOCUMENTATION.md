@@ -33,6 +33,9 @@ Authorization: Bearer <access_token>
 19. [Customer Payments (Sales)](#19-customer-payments-sales)
 20. [Customer Refunds (Sales)](#20-customer-refunds-sales)
 21. [Credit Notes (Sales)](#21-credit-notes-sales)
+22. [Reports](#22-reports)
+23. [Idempotency & Maker–Checker](#23-idempotency--makerchecker)
+24. [Approvals API (Maker–Checker Queue)](#24-approvals-api-makerchecker-queue)
 
 ---
 
@@ -1005,6 +1008,7 @@ Account Sub-Type, ZATCA Mapping, Locked, Archived, Enable Payment, Show in Expen
 
 ### 6.2 Create Draft Journal Entry
 - **URL:** `POST /accounting/journal-entries/`
+- **Required header:** `Idempotency-Key: <unique-string>`
 
 > Creates a draft entry. Drafts are editable. A minimum of 2 lines is required.
 
@@ -1146,6 +1150,7 @@ Account Sub-Type, ZATCA Mapping, Locked, Archived, Enable Payment, Show in Expen
 > Transitions a draft entry to **posted** (immutable). Assigns a sequential reference number.
 
 - **URL:** `POST /accounting/journal-entries/<uuid>/post/`
+- **Required header:** `Idempotency-Key: <unique-string>`
 - **Body:** None
 
 **Validations performed:**
@@ -1184,6 +1189,8 @@ Account Sub-Type, ZATCA Mapping, Locked, Archived, Enable Payment, Show in Expen
 > All debit/credit amounts are swapped. The original entry remains unchanged.
 
 - **URL:** `POST /accounting/journal-entries/<uuid>/reverse/`
+- **Required header:** `Idempotency-Key: <unique-string>`
+- If maker–checker is enabled, returns `202` and creates an approval request (no reversal yet).
 
 **Request Body (all fields optional):**
 ```json
@@ -2743,11 +2750,15 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 13.2 Create Bill
 
 - **URL:** `POST /purchases/bills/`
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
+- **Business dedupe field:** `external_reference` (optional, recommended)
+- **DB rule:** when `external_reference` is non-empty, `(supplier, external_reference)` must be unique.
 
 **Request Body:**
 ```json
 {
   "bill_number": "BILL-2024-001",
+  "external_reference": "ERP-BILL-9002",
   "supplier": "supplier-uuid",
   "bill_date": "2026-03-23",
   "due_date": "2026-04-22",
@@ -2819,6 +2830,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 13.4 Update Bill
 
 - **URL:** `PATCH /purchases/bills/<uuid>/`
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
 - Draft bills are editable.
 - Posted bills return `422 BILL_POSTED`.
 
@@ -2833,6 +2845,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 13.5 Delete Bill
 
 - **URL:** `DELETE /purchases/bills/<uuid>/`
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
 - Soft delete for draft bills.
 - Posted bills return `422 BILL_POSTED`.
 
@@ -2841,18 +2854,18 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 13.6 Confirm & Post Bill
 
 - **URL:** `POST /purchases/bills/<uuid>/post/`
+- **Required header:** `Idempotency-Key: <unique-string>`
 - Changes bill `status` to `posted` and sets `posted_at`.
-- Optional: creates and posts a Journal Entry.
+- Always creates and posts a Journal Entry atomically.
 
 **Request Body (minimum):**
 ```json
 {}
 ```
 
-**Request Body (with JE creation):**
+**Request Body (with optional account overrides):**
 ```json
 {
-  "create_journal_entry": true,
   "payable_account": "optional-account-uuid",
   "vat_account": "optional-account-uuid",
   "posting_date": "2026-03-23",
@@ -2860,7 +2873,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 }
 ```
 
-**JE defaults when `create_journal_entry=true`:**
+**JE defaults:**
 - `payable_account`: CoA code `211` (Accounts Payable) if not provided
 - `vat_account`: CoA code `116` (VAT Receivable) if not provided
 
@@ -2896,6 +2909,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 | `payment_date` | date | ✅ | Payment date |
 | `description` | string | ✅ | Optional memo/description |
 | `is_posted` | bool | ✅ | Posted flag |
+| `journal_entry` | UUID \| null | read-only | Linked posted Journal Entry |
 | `amount_applied` | decimal string | read-only | Sum of allocations applied to bills |
 | `remaining_amount` | decimal string | read-only | `amount_paid - amount_applied` |
 | `allocations` | array | ✅ | Bill allocations (for bill payments) |
@@ -2910,6 +2924,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 14.3 Create Supplier Payment
 
 - **URL:** `POST /purchases/supplier-payments/`
+- **Required header:** `Idempotency-Key: <unique-string>`
 
 **Request Body (Bill Payment):**
 ```json
@@ -3150,11 +3165,13 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 18.3 Create Invoice (Save as Draft)
 
 - **URL:** `POST /sales/invoices/`
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
 
 **Request Body:**
 ```json
 {
   "invoice_number": "INV-10101",
+  "external_reference": "ERP-INV-8891",
   "customer": "customer-uuid",
   "date": "2026-03-24",
   "due_date": "2026-04-24",
@@ -3173,9 +3190,13 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 }
 ```
 
+- **Business dedupe field:** `external_reference` (optional, recommended)
+- **DB rule:** when `external_reference` is non-empty, `(customer, external_reference)` must be unique.
+
 ### 18.4 Retrieve / Update / Delete Invoice
 
 - **URL:** `GET/PATCH/DELETE /sales/invoices/<uuid>/`
+- **Required header (PATCH/DELETE):** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
 - Draft invoices are editable/deletable.
 - Posted invoices are locked:
   - `PATCH` returns `422 INVOICE_POSTED`
@@ -3184,17 +3205,99 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 18.5 Confirm & Post Invoice
 
 - **URL:** `POST /sales/invoices/<uuid>/post/`
+- **Required header:** `Idempotency-Key: <unique-string>`
+- If maker–checker is enabled, returns `202` and creates an approval request (no posting yet).
 - Sets:
   - `status = posted`
   - `posted_at = now`
-- Optional payload:
+- Also performs:
+  - mandatory balanced JE posting
+  - ZATCA artifact generation (`zatca_uuid`, hash chain, signed hash placeholder, XML, TLV QR)
+  - accounting period lock check (posting blocked for closed periods)
+- Payload:
+```json
+{}
+```
+
+### 18.6 Submit Posted Invoice to ZATCA
+
+- **URL:** `POST /sales/invoices/<uuid>/zatca/submit/`
+- Only posted invoices are accepted.
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts legacy `X-Idempotency-Key`)
+- Duplicate submit with same idempotency key returns current invoice state without re-submission.
+- **Permissions:** requires role permission `vat_zatca.can_approve=true` (or staff/superuser).
+
+**Request Body:**
 ```json
 {
-  "qr_code_text": "BASE64_OR_TEXT_FOR_ZATCA_QR"
+  "submission_type": "clearance"
 }
 ```
 
-### 18.6 Invoice Object Fields
+`submission_type` choices:
+- `clearance`
+- `reporting`
+
+**Status lifecycle (normalized):**
+- `pending` → request accepted/queued, awaiting final outcome
+- `reported` → final success for reporting flow
+- `cleared` → final success for clearance flow
+- `rejected` → final non-retryable rejection (business/profile/signature validation)
+- `failed` → technical failure at caller level (check submission logs for retry/final state)
+
+**Retry policy:**
+- Retries are only for transport/transient failures (e.g., timeout, connection error, HTTP 5xx/429).
+- Business rejections (HTTP 4xx validation/profile failures) are treated as final failures.
+
+**Common errors:**
+- `400 IDEMPOTENCY_KEY_REQUIRED` (missing idempotency header)
+- `422 NOT_POSTED` (invoice not posted yet)
+- `422 ZATCA_VALIDATION_ERROR` (document failed strict ZATCA pre-submission validation)
+- `503 ZATCA_SUBMISSION_FAILED` (submission failed or real transport not configured)
+
+**`422 ZATCA_VALIDATION_ERROR` response:**
+```json
+{
+  "error": "ZATCA_VALIDATION_ERROR",
+  "message": "ZATCA validation failed.",
+  "details": [
+    {
+      "field": "qr_code_text",
+      "code": "TLV_MISSING_TAG",
+      "message": "QR TLV missing required tag 2 (VAT number)."
+    }
+  ]
+}
+```
+
+**Validation rules (enforced before live submission):**
+- Company Settings must include:
+  - seller name (`company_settings.company_name`)
+  - VAT number (`company_settings.vat_registration_number`)
+- QR must be valid TLV base64 and include tags:
+  - `1` Seller name
+  - `2` VAT number (must match Company VAT)
+  - `3` Timestamp
+  - `4` Invoice total
+  - `5` VAT total
+- `zatca_xml` and `zatca_invoice_hash` must exist and match.
+
+### 18.7 Verify Invoice ZATCA Hash Integrity
+
+- **URL:** `GET /sales/invoices/<uuid>/zatca/verify/`
+- Recomputes hash from stored `zatca_xml` and compares with `zatca_invoice_hash`.
+- **Permissions:** requires role permission `vat_zatca.can_view=true` (or staff/superuser).
+
+**Success `200`:**
+```json
+{
+  "stored_hash": "abc123...",
+  "computed_hash": "abc123...",
+  "is_valid": true
+}
+```
+
+### 18.8 Invoice Object Fields
 
 | Field | Type | Writable | Description |
 |---|---|---|---|
@@ -3209,8 +3312,18 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 | `status` | string | read-only | `draft` \| `posted` \| `paid` \| `partially_paid` \| `overdue` |
 | `status_display` | string | read-only | Human-readable status |
 | `posted_at` | datetime \| null | read-only | Posting timestamp |
-| `qr_code_text` | string | set on post | ZATCA QR payload text |
-| `journal_entry` | UUID \| null | read-only | Linked JE (reserved for posting workflow extension) |
+| `qr_code_text` | string | read-only | ZATCA QR payload text (TLV base64 generated on post) |
+| `zatca_uuid` | string | read-only | Immutable ZATCA UUID generated on post |
+| `zatca_previous_hash` | string | read-only | Previous posted document hash for chain |
+| `zatca_invoice_hash` | string | read-only | SHA-256 hash of generated invoice XML |
+| `zatca_signed_hash` | string | read-only | Signed hash placeholder (until cert signing integration) |
+| `zatca_submission_status` | string | read-only | `not_submitted` \| `pending` \| `reported` \| `cleared` \| `rejected` \| `failed` |
+| `zatca_submission_type` | string | read-only | `clearance` \| `reporting` |
+| `zatca_submission_reference` | string | read-only | ZATCA/simulation reference ID |
+| `zatca_submission_error` | string | read-only | Last submission error message |
+| `zatca_submitted_at` | datetime \| null | read-only | Submission attempt timestamp |
+| `zatca_cleared_at` | datetime \| null | read-only | Reported/cleared timestamp |
+| `journal_entry` | UUID \| null | read-only | Linked posted Journal Entry |
 | `subtotal` | decimal string | read-only | Sum of line subtotals |
 | `total_vat` | decimal string | read-only | Sum of line VAT |
 | `total_amount` | decimal string | read-only | Final invoice total |
@@ -3236,6 +3349,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 19.2 Create Customer Payment
 
 - **URL:** `POST /sales/customer-payments/`
+- **Required header:** `Idempotency-Key: <unique-string>`
 
 **Request Body (Invoice Payment):**
 ```json
@@ -3270,7 +3384,9 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 19.3 Retrieve / Update / Delete Customer Payment
 
 - **URL:** `GET/PATCH/DELETE /sales/customer-payments/<uuid>/`
-- On update/delete, existing allocations are rolled back from invoice `paid_amount` first, then reapplied (for PATCH).
+- Posted payments are immutable:
+  - `PATCH` returns `422 PAYMENT_POSTED`
+  - `DELETE` returns `422 PAYMENT_POSTED`
 
 ### 19.4 Outstanding Invoices (for Payment Allocation Grid)
 
@@ -3294,6 +3410,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 | `payment_date` | date | ✅ | Payment date |
 | `description` | string | ✅ | Optional memo |
 | `is_posted` | bool | ✅ | Posted flag |
+| `journal_entry` | UUID \| null | read-only | Linked posted Journal Entry |
 | `amount_applied` | decimal string | read-only | Sum of allocations |
 | `remaining_amount` | decimal string | read-only | `amount_received - amount_applied` |
 | `allocations` | array | write via request body, read in response | Applied invoice allocations |
@@ -3314,6 +3431,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 - `400 CUSTOMER_REQUIRED` (missing customer query for outstanding invoices)
 - `404 NOT_FOUND` (payment not found)
 - `422 VALIDATION_ERROR` (allocation/business validation)
+- `422 VALIDATION_ERROR` with message like `Posting date YYYY-MM-DD is in a closed accounting period.`
 
 ---
 
@@ -3330,6 +3448,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 20.2 Create Customer Refund
 
 - **URL:** `POST /sales/customer-refunds/`
+- **Required header:** `Idempotency-Key: <unique-string>`
 
 **Request Body:**
 ```json
@@ -3350,7 +3469,9 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 20.3 Retrieve / Update / Delete Customer Refund
 
 - **URL:** `GET/PATCH/DELETE /sales/customer-refunds/<uuid>/`
-- On update/delete, current allocations are rolled back from credit note `refunded_amount` first, then reapplied (for PATCH).
+- Posted refunds are immutable:
+  - `PATCH` returns `422 REFUND_POSTED`
+  - `DELETE` returns `422 REFUND_POSTED`
 
 ### 20.4 Outstanding Credit Notes (for Allocation Grid)
 
@@ -3372,6 +3493,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 | `refund_date` | date | ✅ | Refund date |
 | `description` | string | ✅ | Optional description |
 | `is_posted` | bool | ✅ | Posted flag |
+| `journal_entry` | UUID \| null | read-only | Linked posted Journal Entry |
 | `amount_applied` | decimal string | read-only | Sum of allocations |
 | `remaining_amount` | decimal string | read-only | `amount_refunded - amount_applied` |
 | `allocations` | array | write via request body, read in response | Applied credit-note allocations |
@@ -3391,6 +3513,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 - `400 CUSTOMER_REQUIRED` (missing customer query for outstanding credit notes)
 - `404 NOT_FOUND` (refund not found)
 - `422 VALIDATION_ERROR` (allocation/business validation)
+- `422 VALIDATION_ERROR` with message like `Posting date YYYY-MM-DD is in a closed accounting period.`
 
 ---
 
@@ -3407,11 +3530,15 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 21.2 Create Credit Note (Save as Draft)
 
 - **URL:** `POST /sales/credit-notes/`
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
+- **Business dedupe field:** `external_reference` (optional, recommended)
+- **DB rule:** when `external_reference` is non-empty, `(customer, external_reference)` must be unique.
 
 **Request Body:**
 ```json
 {
   "credit_note_number": "CN-INV100101",
+  "external_reference": "ERP-CN-4477",
   "customer": "customer-uuid",
   "date": "2026-03-24",
   "note": "Return/adjustment",
@@ -3440,17 +3567,72 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 ### 21.4 Confirm & Post Credit Note
 
 - **URL:** `POST /sales/credit-notes/<uuid>/post/`
+- **Required header:** `Idempotency-Key: <unique-string>`
+- If maker–checker is enabled, returns `202` and creates an approval request (no posting yet).
 - Sets:
   - `status = posted`
   - `posted_at = now`
-- Optional payload:
+- Also performs:
+  - mandatory balanced JE posting
+  - ZATCA artifact generation (`zatca_uuid`, hash chain, signed hash placeholder, XML, TLV QR)
+  - accounting period lock check (posting blocked for closed periods)
+- Payload:
+```json
+{}
+```
+
+### 21.5 Submit Posted Credit Note to ZATCA
+
+- **URL:** `POST /sales/credit-notes/<uuid>/zatca/submit/`
+- Only posted credit notes are accepted.
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts legacy `X-Idempotency-Key`)
+- Duplicate submit with same idempotency key returns current credit-note state without re-submission.
+- **Permissions:** requires role permission `vat_zatca.can_approve=true` (or staff/superuser).
+
+**Request Body:**
 ```json
 {
-  "qr_code_text": "BASE64_OR_TEXT_FOR_ZATCA_QR"
+  "submission_type": "reporting"
 }
 ```
 
-### 21.5 Credit Note Object Fields
+`submission_type` choices:
+- `clearance`
+- `reporting`
+
+**Status lifecycle (normalized):**
+- `pending` → request accepted/queued, awaiting final outcome
+- `reported` → final success for reporting flow
+- `cleared` → final success for clearance flow
+- `rejected` → final non-retryable rejection (business/profile/signature validation)
+- `failed` → technical failure at caller level (check submission logs for retry/final state)
+
+**Retry policy:**
+- Retries are only for transport/transient failures (e.g., timeout, connection error, HTTP 5xx/429).
+- Business rejections (HTTP 4xx validation/profile failures) are treated as final failures.
+
+**Common errors:**
+- `400 IDEMPOTENCY_KEY_REQUIRED` (missing idempotency header)
+- `422 NOT_POSTED` (credit note not posted yet)
+- `422 ZATCA_VALIDATION_ERROR` (document failed strict ZATCA pre-submission validation)
+- `503 ZATCA_SUBMISSION_FAILED` (submission failed or real transport not configured)
+
+### 21.6 Verify Credit Note ZATCA Hash Integrity
+
+- **URL:** `GET /sales/credit-notes/<uuid>/zatca/verify/`
+- Recomputes hash from stored `zatca_xml` and compares with `zatca_invoice_hash`.
+- **Permissions:** requires role permission `vat_zatca.can_view=true` (or staff/superuser).
+
+**Success `200`:**
+```json
+{
+  "stored_hash": "abc123...",
+  "computed_hash": "abc123...",
+  "is_valid": true
+}
+```
+
+### 21.7 Credit Note Object Fields
 
 | Field | Type | Writable | Description |
 |---|---|---|---|
@@ -3463,8 +3645,18 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 | `attachment` | file/url \| null | ✅ | Optional attachment |
 | `status` | string | read-only | `draft` \| `posted` |
 | `posted_at` | datetime \| null | read-only | Posting timestamp |
-| `qr_code_text` | string | set on post | ZATCA QR payload text |
-| `journal_entry` | UUID \| null | read-only | Linked JE (reserved for posting workflow extension) |
+| `qr_code_text` | string | read-only | ZATCA QR payload text (TLV base64 generated on post) |
+| `zatca_uuid` | string | read-only | Immutable ZATCA UUID generated on post |
+| `zatca_previous_hash` | string | read-only | Previous posted document hash for chain |
+| `zatca_invoice_hash` | string | read-only | SHA-256 hash of generated credit-note XML |
+| `zatca_signed_hash` | string | read-only | Signed hash placeholder (until cert signing integration) |
+| `zatca_submission_status` | string | read-only | `not_submitted` \| `pending` \| `reported` \| `cleared` \| `rejected` \| `failed` |
+| `zatca_submission_type` | string | read-only | `clearance` \| `reporting` |
+| `zatca_submission_reference` | string | read-only | ZATCA/simulation reference ID |
+| `zatca_submission_error` | string | read-only | Last submission error message |
+| `zatca_submitted_at` | datetime \| null | read-only | Submission attempt timestamp |
+| `zatca_cleared_at` | datetime \| null | read-only | Reported/cleared timestamp |
+| `journal_entry` | UUID \| null | read-only | Linked posted Journal Entry |
 | `subtotal` | decimal string | read-only | Sum of line subtotals |
 | `total_vat` | decimal string | read-only | Sum of line VAT |
 | `total_amount` | decimal string | read-only | Final credit note total |
@@ -3474,3 +3666,257 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 | `lines` | array | ✅ | Credit note lines |
 | `created_at` | datetime | read-only | ISO 8601 |
 | `updated_at` | datetime | read-only | ISO 8601 |
+
+---
+
+## 22. Reports
+
+### 22.1 Statement of Account
+
+- **URL:** `GET /accounting/reports/statement-of-account/`
+- **Query params:**
+  - `account=<uuid>` OR `account_code=<string>`
+  - `date_from=YYYY-MM-DD` (optional)
+  - `date_to=YYYY-MM-DD` (optional)
+  - `search=<string>` (optional)
+  - `source=<string>` (optional: `Bill`, `Invoice`, `Credit Note`, `Journal Entry`, etc.)
+  - `page`, `page_size`
+  - `export=csv` (optional; returns downloadable CSV)
+
+**Success `200` (paginated):**
+```json
+{
+  "count": 2,
+  "next": null,
+  "previous": null,
+  "results": {
+    "account": { "id": "acc-uuid", "code": "411", "name": "Sales" },
+    "opening_balance": "0.00",
+    "results": [
+      {
+        "date": "2026-02-26",
+        "account_id": "acc-uuid",
+        "account": "411 - Sales",
+        "serial_number": "JE-000123",
+        "source": "Invoice",
+        "activity": "Payment of Invoice 100101",
+        "debit": "620.00",
+        "credit": "0.00",
+        "balance": "620.00"
+      }
+    ]
+  }
+}
+```
+
+**Errors:**
+- `400 ACCOUNT_REQUIRED` if neither `account` nor `account_code` provided
+
+### 22.2 Profit and Loss
+
+- **URL:** `GET /accounting/reports/profit-and-loss/`
+- **Query params:**
+  - `date_from=YYYY-MM-DD` (optional)
+  - `date_to=YYYY-MM-DD` (optional)
+  - `group_by=none|month` (default `none`)
+  - `layout=vertical|horizontal` (default `vertical`) — same payload; frontend changes presentation
+  - `export=csv` (optional)
+
+**Notes:**
+- Calculated from **posted** journal entry lines.
+- Revenue/expense values are derived as \(credit - debit\), so expenses usually appear as **negative** numbers.
+- Sections are derived from account code prefixes: `41 Income`, `51 Cost of Sales`, `52 Operating Expenses`, `42 Other Income`, `53 Non-Operating Expenses`.
+
+**Success `200` (example):**
+```json
+{
+  "meta": {
+    "date_from": "2026-01-01",
+    "date_to": "2026-03-31",
+    "group_by": "month",
+    "layout": "vertical"
+  },
+  "columns": [
+    { "key": "total", "label": "Total" },
+    { "key": "2026-01", "label": "Jan 2026" },
+    { "key": "2026-02", "label": "Feb 2026" },
+    { "key": "2026-03", "label": "Mar 2026" }
+  ],
+  "rows": [
+    { "type": "section", "code": "41", "label": "41 Income" },
+    {
+      "type": "account",
+      "account_id": "acc-uuid",
+      "code": "411",
+      "name": "Sales",
+      "values": { "total": "220.00", "2026-01": "0.00", "2026-02": "220.00", "2026-03": "0.00" }
+    },
+    {
+      "type": "section_total",
+      "code": "41",
+      "label": "Total Income",
+      "values": { "total": "220.00", "2026-01": "0.00", "2026-02": "220.00", "2026-03": "0.00" }
+    },
+    {
+      "type": "net",
+      "label": "Net Profit/Loss",
+      "values": { "total": "-1830.00", "2026-01": "0.00", "2026-02": "-1830.00", "2026-03": "0.00" }
+    }
+  ]
+}
+```
+
+### 22.3 General Ledger
+
+- **URL:** `GET /accounting/reports/general-ledger/`
+- **Query params:**
+  - `date_from=YYYY-MM-DD` (optional)
+  - `date_to=YYYY-MM-DD` (optional)
+  - `account=<uuid>` (optional)
+  - `account_code=<string>` (optional)
+  - `source=<string>` (optional)
+  - `search=<string>` (optional)
+  - `page`, `page_size`
+  - `export=csv` (optional)
+
+**Success `200` (paginated):**
+```json
+{
+  "count": 2,
+  "next": null,
+  "previous": null,
+  "results": {
+    "results": [
+      {
+        "journal_id": "JE-000101",
+        "source": "Invoice",
+        "date": "2026-02-26",
+        "account_id": "acc-uuid",
+        "account": "411 - Sales",
+        "description": "Payment of Invoice 100101",
+        "journal_note": "Payment of Invoice 100101",
+        "debit": "620.00",
+        "credit": "0.00",
+        "balance": "620.00"
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+- Uses only **posted** journal entries.
+- Running balance is calculated **per account** in chronological order.
+
+---
+
+## 23. Idempotency & Maker–Checker
+
+### 23.1 Idempotency (Exactly-once for financial mutations)
+
+For all endpoints that mutate financial state (posting, payments, adjustments, journal actions), send:
+
+```
+Idempotency-Key: <unique-string>
+```
+
+Also accepted for backward compatibility:
+
+```
+X-Idempotency-Key: <unique-string>
+```
+
+Behavior:
+- Replaying the same request with the same key returns the previous response.
+- Re-using a key with a different payload returns `409 IDEMPOTENCY_CONFLICT`.
+- If a request is currently executing, duplicates return `409 IDEMPOTENCY_IN_PROGRESS`.
+- Semantic dedupe is enabled per scope: if the exact same payload already succeeded,
+  replay returns the prior successful response even if the client sent a new idempotency key.
+- Keys are unique per `(scope, key)` (not global across all endpoints).
+
+Financial mutation scopes currently covered include:
+- create/update/delete/post for invoices, bills, and credit notes
+- payment/refund create/update/delete
+- inventory adjustment post
+- journal entry create/post/reverse
+- period close/reopen actions
+- approvals approve/deny execute paths
+- invoice/credit-note ZATCA submit
+
+### 23.2 Maker–Checker (approval workflow)
+
+When enabled, sensitive actions require:
+- **User A**: creates the request (system creates an `ApprovalRequest`)
+- **User B**: approves (must be different from requester)
+- **System**: executes the action and stores the result
+
+Enable via env:
+- `MAKER_CHECKER_ENABLED=true`
+- Optional per-scope override:
+  - `MAKER_CHECKER_SALES_INVOICE_POST=true`
+  - `MAKER_CHECKER_ACCOUNTING_JOURNAL_ENTRY_REVERSE=true`
+  - `MAKER_CHECKER_ACCOUNTING_PERIOD_REOPEN=true`
+
+Actions covered:
+- Invoice post (optional per org, controlled by env)
+- Credit note post (optional per org, controlled by env)
+- Journal entry reversal
+- Period reopen
+
+### 23.3 VAT rounding strategy (lock globally)
+
+VAT totals must be consistent across invoices, credit notes, bills, and debit notes.
+This backend uses a single global rounding strategy configured by env:
+
+- `VAT_ROUNDING_STRATEGY=line` (default): round VAT per line to 2 decimals, then sum
+- `VAT_ROUNDING_STRATEGY=invoice`: sum VAT at higher precision, then round at document totals
+
+---
+
+## 24. Approvals API (Maker–Checker Queue)
+
+All approvals endpoints require Admin (staff/superuser or role name `Admin`).
+
+### 24.1 List approvals
+- **URL:** `GET /main/approvals/`
+- **Query params:** `status=<pending|approved|denied|executed|failed>`, `scope=<scope>`
+
+---
+
+## 26. ZATCA Submission Log Fields (Ops/Debug)
+
+`ZatcaSubmissionLog` now persists provider-side response metadata for authority-grade tracing:
+
+- `provider_request_id` (parsed from response body keys like `requestId`)
+- `provider_correlation_id` (from response headers like `x-correlation-id` / `x-request-id`)
+- `provider_status` (raw provider status token before normalization)
+- `response_headers` (normalized lower-case header map)
+- `status` (workflow status: `pending|retrying|succeeded|failed_final`)
+- `response_reference` (best effort provider request/correlation reference)
+
+Use these fields for support tickets, reconciliation, and SLA monitoring.
+
+### 24.2 Approve + execute
+- **URL:** `POST /main/approvals/<uuid>/approve/`
+- **Rules:**
+  - requester cannot approve own request (`403 SELF_APPROVAL_FORBIDDEN`)
+  - only pending approvals can be approved (`422 NOT_PENDING`)
+
+### 24.3 Deny
+- **URL:** `POST /main/approvals/<uuid>/deny/`
+- **Required header:** `Idempotency-Key: <unique-string>` (also accepts `X-Idempotency-Key`)
+- **Body:** `{ "reason": "..." }`
+
+---
+
+## 25. Operations & Integrity
+
+### 25.1 Financial Integrity Report Command
+
+- **Command:** `python manage.py report_financial_integrity`
+- **Strict mode:** `python manage.py report_financial_integrity --fail-on-error`
+- **Checks:**
+  - posted invoices / bills / credit notes without journal entry
+  - over-allocated supplier and customer payments
+  - over-allocated customer refunds
+  - over-applied invoices / bills and over-refunded credit notes

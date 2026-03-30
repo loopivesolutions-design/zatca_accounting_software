@@ -112,3 +112,122 @@ class CompanySettings(models.Model):
 
     def __str__(self):
         return self.company_name or "Company Settings"
+
+
+IDEMPOTENCY_STATE_CHOICES = (
+    ("processing", "Processing"),
+    ("succeeded", "Succeeded"),
+    ("failed", "Failed"),
+)
+
+
+class IdempotencyRecord(BaseModel):
+    """
+    Generic idempotency storage for all financial mutations.
+    Ensures exactly-once semantics on network retries.
+    """
+
+    # Unique per (scope, key). Reusing the same key across different endpoints should be allowed.
+    key = models.CharField(max_length=120, db_index=True)
+    scope = models.CharField(max_length=120, db_index=True)  # e.g. sales.invoice.post
+    method = models.CharField(max_length=10, db_index=True)
+    path = models.CharField(max_length=255, db_index=True)
+    request_hash = models.CharField(max_length=64, db_index=True)
+    state = models.CharField(max_length=20, choices=IDEMPOTENCY_STATE_CHOICES, default="processing", db_index=True)
+    response_status = models.PositiveIntegerField(null=True, blank=True)
+    response_body = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "idempotency_record"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["scope", "method", "path", "key"], name="uniq_idempotency_scope_method_path_key"),
+        ]
+
+
+APPROVAL_STATUS_CHOICES = (
+    ("pending", "Pending"),
+    ("approved", "Approved"),
+    ("denied", "Denied"),
+    ("executed", "Executed"),
+    ("failed", "Failed"),
+)
+
+
+class ApprovalRequest(BaseModel):
+    """
+    Maker-checker approval workflow for sensitive financial actions.
+    """
+
+    scope = models.CharField(max_length=120, db_index=True)  # e.g. sales.invoice.post
+    object_type = models.CharField(max_length=80, db_index=True)  # e.g. sales.Invoice
+    object_id = models.UUIDField(db_index=True)
+    payload = models.JSONField(default=dict, blank=True)  # request body snapshot
+
+    status = models.CharField(max_length=20, choices=APPROVAL_STATUS_CHOICES, default="pending", db_index=True)
+    requested_by = models.ForeignKey(
+        "user.CustomUser",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approval_requests_made",
+    )
+    approved_by = models.ForeignKey(
+        "user.CustomUser",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approval_requests_approved",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    executed_at = models.DateTimeField(null=True, blank=True)
+    result_status = models.PositiveIntegerField(null=True, blank=True)
+    result_body = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "approval_request"
+        ordering = ["-created_at"]
+
+
+class MaintenanceAuditLog(BaseModel):
+    """Audit trail for sensitive maintenance/repair operations."""
+    action = models.CharField(max_length=100, db_index=True)
+    reason = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "maintenance_audit_log"
+        ordering = ["-created_at"]
+
+
+class ScheduledJobRun(BaseModel):
+    """Run-once guard for scheduled jobs (job_type + period)."""
+    job_type = models.CharField(max_length=100, db_index=True)
+    period_key = models.CharField(max_length=100, db_index=True)
+    status = models.CharField(max_length=20, default="succeeded", db_index=True)
+    details = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "scheduled_job_run"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["job_type", "period_key"], name="uniq_scheduled_job_period"),
+        ]
+
+
+class BulkExecutionItem(BaseModel):
+    """Per-item bulk idempotency ledger to avoid duplicates on partial retries."""
+    scope = models.CharField(max_length=120, db_index=True)
+    batch_id = models.CharField(max_length=120, db_index=True)
+    item_key = models.CharField(max_length=120, db_index=True)
+    state = models.CharField(max_length=20, default="succeeded", db_index=True)
+    response_body = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "bulk_execution_item"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["scope", "batch_id", "item_key"], name="uniq_bulk_scope_batch_item"),
+        ]

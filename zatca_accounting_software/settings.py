@@ -20,13 +20,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Load environment variables from .env
 load_dotenv(BASE_DIR / '.env')
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-fallback-key')
+# SECURITY WARNING: keep the secret key used in production secret.
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required.")
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
+# SECURITY WARNING: don't run with debug turned on in production.
+DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = [h.strip() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip()]
+
+# VAT rounding strategy: "line" (default) or "invoice"
+VAT_ROUNDING_STRATEGY = os.getenv("VAT_ROUNDING_STRATEGY", "line").strip().lower()
+
+# When True, get_system_account() never falls back to Account.code.
+# Default: strict in production (DEBUG=False), relaxed in development unless explicitly forced.
+_strict_env = (os.getenv("ACCOUNTING_STRICT_SYSTEM_ACCOUNTS", "") or "").strip().lower()
+if _strict_env in {"1", "true", "yes", "on"}:
+    ACCOUNTING_STRICT_SYSTEM_ACCOUNTS = True
+elif _strict_env in {"0", "false", "no", "off"}:
+    ACCOUNTING_STRICT_SYSTEM_ACCOUNTS = False
+else:
+    ACCOUNTING_STRICT_SYSTEM_ACCOUNTS = not DEBUG
 
 
 # Application definition
@@ -43,7 +58,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'main',
     'user',
-    'accounting',
+    'accounting.apps.AccountingConfig',
     'products',
     'purchases',
     'sales',
@@ -167,3 +182,50 @@ BACKEND_URL = os.getenv('BACKEND_URL', 'http://127.0.0.1:8000')
 _cors_origins = os.getenv('CORS_ALLOWED_ORIGINS', '')
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(',') if o.strip()]
 CORS_ALLOW_CREDENTIALS = True
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name, "") or "").strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+# When True, new invoice/credit-note posting is blocked if the last verify_zatca_hash_chain run failed.
+# Default: on in production so a broken chain cannot accumulate more documents unnoticed.
+ZATCA_BLOCK_POST_ON_CHAIN_FAILURE = _env_bool(
+    "ZATCA_BLOCK_POST_ON_CHAIN_FAILURE",
+    default=not DEBUG,
+)
+
+# Optional TLV tags 7–9 (ECDSA) in QR — enable only when your certification profile requires them.
+ZATCA_QR_INCLUDE_ECDSA = _env_bool("ZATCA_QR_INCLUDE_ECDSA", default=False)
+
+# ZATCA API simulation (no HTTP to authority). Unset env → True when DEBUG=True, False when DEBUG=False.
+_zat_sim = (os.getenv("ZATCA_SIMULATION_MODE", "") or "").strip().lower()
+if _zat_sim in {"1", "true", "yes", "on"}:
+    ZATCA_SIMULATION_MODE = True
+elif _zat_sim in {"0", "false", "no", "off"}:
+    ZATCA_SIMULATION_MODE = False
+else:
+    ZATCA_SIMULATION_MODE = DEBUG
+
+# When True (default in production), JournalEntry.post() must run inside journal_post_gate / AccountingEngine.
+_je_gate = (os.getenv("ENFORCE_JOURNAL_ENTRY_POST_GATE", "") or "").strip().lower()
+if _je_gate in {"1", "true", "yes", "on"}:
+    ENFORCE_JOURNAL_ENTRY_POST_GATE = True
+elif _je_gate in {"0", "false", "no", "off"}:
+    ENFORCE_JOURNAL_ENTRY_POST_GATE = False
+else:
+    ENFORCE_JOURNAL_ENTRY_POST_GATE = not DEBUG
+
+# Persisted ZATCA evidence on successful HTTP responses must pass is_complete() when strict.
+_zat_ev = (os.getenv("ZATCA_STRICT_EVIDENCE_COMPLETENESS", "") or "").strip().lower()
+if _zat_ev in {"1", "true", "yes", "on"}:
+    ZATCA_STRICT_EVIDENCE_COMPLETENESS = True
+elif _zat_ev in {"0", "false", "no", "off"}:
+    ZATCA_STRICT_EVIDENCE_COMPLETENESS = False
+else:
+    ZATCA_STRICT_EVIDENCE_COMPLETENESS = not DEBUG

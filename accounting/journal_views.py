@@ -27,6 +27,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from main.idempotency import begin_idempotent, finalize_idempotent_failure, finalize_idempotent_success
+from .accounting_engine import AccountingEngine
 from .exceptions import AccountError
 from .models import JournalEntry
 from .journal_serializers import (
@@ -36,6 +38,8 @@ from .journal_serializers import (
     JournalEntryReverseSerializer,
 )
 from .validators import JournalEntryValidator
+from main.allocation_validator import AllocationValidator
+from main.approvals import create_approval_request, maker_checker_enabled
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -112,11 +116,17 @@ class JournalEntryListCreateAPI(APIView):
         return paginator.get_paginated_response(serializer.data)
 
     def post(self, request):
+        rec, early = begin_idempotent(request, scope="accounting.journal_entry.create")
+        if early:
+            return early
+
         serializer = JournalEntrySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         entry = serializer.save(creator=request.user)
         out = JournalEntryDetailSerializer(entry)
-        return Response(out.data, status=status.HTTP_201_CREATED)
+        response = Response(out.data, status=status.HTTP_201_CREATED)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -202,20 +212,61 @@ class JournalEntryPostAPI(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
+        rec, early = begin_idempotent(request, scope="accounting.journal_entry.post")
+        if early:
+            return early
+
         entry = _get_entry(pk)
         if not entry:
-            return Response(
-                {"error": "NOT_FOUND", "message": "Journal entry not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Journal entry not found.", http_status=status.HTTP_404_NOT_FOUND)  # type: ignore[arg-type]
         try:
-            entry.post()
+            AllocationValidator.validate_manual_journal_post_preconditions(entry)
+        except ValueError as exc:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="POST_VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        if maker_checker_enabled("accounting.journal_entry.post"):
+            approval = create_approval_request(
+                scope="accounting.journal_entry.post",
+                object_type="accounting.JournalEntry",
+                object_id=entry.id,
+                payload={},
+                requested_by=request.user,
+            )
+            response = Response(
+                {"message": "Approval required.", "approval_id": str(approval.id), "status": approval.status},
+                status=status.HTTP_202_ACCEPTED,
+            )
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
+
+        try:
+            AccountingEngine.post_journal_entry(entry)
         except AccountError as exc:
-            return _je_error_response(exc)
-        return Response(
+            resp = _je_error_response(exc)
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error=resp.data.get("error", "POST_VALIDATION_ERROR") if isinstance(resp.data, dict) else "POST_VALIDATION_ERROR",
+                message=resp.data.get("message", "Unable to post journal entry.") if isinstance(resp.data, dict) else "Unable to post journal entry.",
+                http_status=resp.status_code,
+            )
+        except ValueError as exc:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="POST_VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        response = Response(
             JournalEntryDetailSerializer(entry).data,
             status=status.HTTP_200_OK,
         )
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -249,12 +300,13 @@ class JournalEntryReverseAPI(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
+        rec, early = begin_idempotent(request, scope="accounting.journal_entry.reverse")
+        if early:
+            return early
+
         entry = _get_entry(pk)
         if not entry:
-            return Response(
-                {"error": "NOT_FOUND", "message": "Journal entry not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Journal entry not found.", http_status=status.HTTP_404_NOT_FOUND)  # type: ignore[arg-type]
 
         serializer = JournalEntryReverseSerializer(
             data=request.data,
@@ -262,6 +314,21 @@ class JournalEntryReverseAPI(APIView):
         )
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        if maker_checker_enabled("accounting.journal_entry.reverse"):
+            approval = create_approval_request(
+                scope="accounting.journal_entry.reverse",
+                object_type="accounting.JournalEntry",
+                object_id=entry.id,
+                payload=data,
+                requested_by=request.user,
+            )
+            response = Response(
+                {"message": "Approval required.", "approval_id": str(approval.id), "status": approval.status},
+                status=status.HTTP_202_ACCEPTED,
+            )
+            finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+            return response
 
         try:
             reversal = entry.create_reversal(
@@ -272,12 +339,25 @@ class JournalEntryReverseAPI(APIView):
             reversal.save(update_fields=["creator"])
 
             if data.get("auto_post", False):
-                reversal.post()
+                AccountingEngine.post_journal_entry(reversal)
 
+        except ValueError as exc:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="REVERSE_VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
         except AccountError as exc:
-            return _je_error_response(exc)
+            resp = _je_error_response(exc)
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error=resp.data.get("error", "REVERSE_VALIDATION_ERROR") if isinstance(resp.data, dict) else "REVERSE_VALIDATION_ERROR",
+                message=resp.data.get("message", "Unable to reverse journal entry.") if isinstance(resp.data, dict) else "Unable to reverse journal entry.",
+                http_status=resp.status_code,
+            )
 
-        return Response(
+        response = Response(
             {
                 "message": (
                     "Reversal entry posted successfully."
@@ -289,3 +369,5 @@ class JournalEntryReverseAPI(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response

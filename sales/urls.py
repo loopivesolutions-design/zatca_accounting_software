@@ -11,6 +11,8 @@ from .views import (
     InvoiceListCreateAPI,
     InvoiceDetailAPI,
     InvoicePostAPI,
+    InvoiceZatcaSubmitAPI,
+    InvoiceZatcaVerifyAPI,
     InvoiceChoicesAPI,
     CustomerPaymentListCreateAPI,
     CustomerPaymentDetailAPI,
@@ -21,6 +23,8 @@ from .views import (
     CustomerCreditNoteListCreateAPI,
     CustomerCreditNoteDetailAPI,
     CustomerCreditNotePostAPI,
+    CreditNoteZatcaSubmitAPI,
+    CreditNoteZatcaVerifyAPI,
 )
 
 app_name = "sales"
@@ -37,6 +41,8 @@ urlpatterns = [
     path("invoices/", InvoiceListCreateAPI.as_view(), name="invoice-list-create"),
     path("invoices/<uuid:pk>/", InvoiceDetailAPI.as_view(), name="invoice-detail"),
     path("invoices/<uuid:pk>/post/", InvoicePostAPI.as_view(), name="invoice-post"),
+    path("invoices/<uuid:pk>/zatca/submit/", InvoiceZatcaSubmitAPI.as_view(), name="invoice-zatca-submit"),
+    path("invoices/<uuid:pk>/zatca/verify/", InvoiceZatcaVerifyAPI.as_view(), name="invoice-zatca-verify"),
     path("customer-payments/", CustomerPaymentListCreateAPI.as_view(), name="customer-payment-list-create"),
     path("customer-payments/<uuid:pk>/", CustomerPaymentDetailAPI.as_view(), name="customer-payment-detail"),
     path("customer-payments/outstanding-invoices/", CustomerOutstandingInvoicesAPI.as_view(), name="customer-outstanding-invoices"),
@@ -46,5 +52,7 @@ urlpatterns = [
     path("credit-notes/", CustomerCreditNoteListCreateAPI.as_view(), name="customer-credit-note-list-create"),
     path("credit-notes/<uuid:pk>/", CustomerCreditNoteDetailAPI.as_view(), name="customer-credit-note-detail"),
     path("credit-notes/<uuid:pk>/post/", CustomerCreditNotePostAPI.as_view(), name="customer-credit-note-post"),
+    path("credit-notes/<uuid:pk>/zatca/submit/", CreditNoteZatcaSubmitAPI.as_view(), name="credit-note-zatca-submit"),
+    path("credit-notes/<uuid:pk>/zatca/verify/", CreditNoteZatcaVerifyAPI.as_view(), name="credit-note-zatca-verify"),
 ]
 

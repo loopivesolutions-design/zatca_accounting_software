@@ -1,6 +1,8 @@
 import re
 from decimal import Decimal
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
+from django.db.models import F, Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from main.models import BaseModel
@@ -32,6 +34,65 @@ ZATCA_MAPPING_CHOICES = (
     ("retained_earnings",   "Retained Earnings"),
     ("cash_and_bank",       "Cash and Bank"),
 )
+
+SYSTEM_ACCOUNT_KEY_CHOICES = (
+    ("ACCOUNTS_RECEIVABLE", "Accounts Receivable"),
+    ("ACCOUNTS_PAYABLE", "Accounts Payable"),
+    ("VAT_OUTPUT", "VAT Output"),
+    ("VAT_INPUT", "VAT Input"),
+    ("SALES_REVENUE", "Sales Revenue"),
+    ("RETAINED_EARNINGS", "Retained Earnings"),
+    ("CASH_AND_BANK", "Cash and Bank"),
+)
+
+class AccountingPeriod(BaseModel):
+    """Simple accounting period lock control for posting governance."""
+    name = models.CharField(_("Period Name"), max_length=100, unique=True)
+    start_date = models.DateField(_("Start Date"), db_index=True)
+    end_date = models.DateField(_("End Date"), db_index=True)
+    is_closed = models.BooleanField(_("Is Closed"), default=False, db_index=True)
+    closed_at = models.DateTimeField(_("Closed At"), null=True, blank=True)
+    closed_by = models.ForeignKey(
+        "user.CustomUser",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="closed_periods",
+        verbose_name=_("Closed By"),
+    )
+    reopened_at = models.DateTimeField(_("Reopened At"), null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        "user.CustomUser",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reopened_periods",
+        verbose_name=_("Reopened By"),
+    )
+    close_reason = models.CharField(_("Close Reason"), max_length=255, blank=True)
+    reopen_reason = models.CharField(_("Reopen Reason"), max_length=255, blank=True)
+
+    class Meta:
+        db_table = "accounting_period"
+        ordering = ["-start_date"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(end_date__gte=F("start_date")),
+                name="accounting_period_end_after_start",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.start_date} to {self.end_date})"
+
+    @classmethod
+    def is_date_closed(cls, date_value) -> bool:
+        return cls.objects.filter(
+            is_deleted=False,
+            is_closed=True,
+            start_date__lte=date_value,
+            end_date__gte=date_value,
+        ).exists()
 
 
 class Account(BaseModel):
@@ -135,6 +196,53 @@ class Account(BaseModel):
         return " > ".join(parts)
 
 
+class SystemAccount(BaseModel):
+    """
+    Immutable registry that maps accounting system keys to CoA accounts.
+    Posting services must resolve accounts through this registry instead of raw account codes.
+    """
+
+    key = models.CharField(max_length=64, choices=SYSTEM_ACCOUNT_KEY_CHOICES, unique=True, db_index=True)
+    account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.PROTECT,
+        related_name="system_account_links",
+        verbose_name=_("Account"),
+    )
+    is_locked = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        db_table = "accounting_system_account"
+        ordering = ["key"]
+        constraints = [
+            models.UniqueConstraint(fields=["account"], name="uniq_system_account_account"),
+        ]
+
+    def __str__(self):
+        return f"{self.key} -> {self.account.code}"
+
+    def clean(self):
+        if self.account_id:
+            if self.account.is_deleted:
+                raise ValidationError("SystemAccount cannot point to a deleted account.")
+            if self.account.is_archived:
+                raise ValidationError("SystemAccount cannot point to an archived account.")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = SystemAccount.objects.filter(pk=self.pk).only("key", "account_id", "is_locked").first()
+            if previous and previous.is_locked:
+                if previous.key != self.key or previous.account_id != self.account_id:
+                    raise ValidationError("Locked SystemAccount mappings cannot be modified.")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.is_locked:
+            raise ValidationError("Locked SystemAccount mappings cannot be deleted.")
+        return super().delete(*args, **kwargs)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Journal Entries
 # Rule 1: Ledger Immutability  — posted entries are permanently read-only
@@ -224,14 +332,41 @@ class JournalEntry(BaseModel):
           2. Assign a sequential reference number
           3. Set status → posted and record posted_at timestamp
         """
+        from django.conf import settings
+
+        from accounting.journal_post_gate import is_journal_post_allowed
+        from accounting.exceptions import JournalEntryPostingForbidden
+
+        enforce = getattr(settings, "ENFORCE_JOURNAL_ENTRY_POST_GATE", None)
+        if enforce is None:
+            enforce = not settings.DEBUG
+        if enforce and not is_journal_post_allowed():
+            raise JournalEntryPostingForbidden()
+
+        if AccountingPeriod.is_date_closed(self.date):
+            raise ValueError(f"Posting not allowed: {self.date} is in a closed accounting period.")
         from .validators import JournalEntryValidator
         JournalEntryValidator.validate_can_post(self)
         with transaction.atomic():
-            if not self.reference:
-                self.reference = self._next_reference()
-            self.status = "posted"
-            self.posted_at = timezone.now()
-            self.save(update_fields=["reference", "status", "posted_at", "updated_at"])
+            # Prevent concurrent "double post" / double reference assignment.
+            locked = JournalEntry.objects.select_for_update().get(pk=self.pk)
+            if locked.status == "posted":
+                # Idempotent: already posted.
+                self.reference = locked.reference
+                self.status = locked.status
+                self.posted_at = locked.posted_at
+                return
+
+            if not locked.reference:
+                locked.reference = self._next_reference()
+            locked.status = "posted"
+            locked.posted_at = timezone.now()
+            locked.save(update_fields=["reference", "status", "posted_at", "updated_at"])
+
+            # Keep in-memory instance consistent for callers.
+            self.reference = locked.reference
+            self.status = locked.status
+            self.posted_at = locked.posted_at
 
     def create_reversal(self, description: str = "", date=None) -> "JournalEntry":
         """
@@ -242,8 +377,12 @@ class JournalEntry(BaseModel):
         from .validators import JournalEntryValidator
         JournalEntryValidator.validate_can_reverse(self)
 
+        reversal_date = date or timezone.now().date()
+        if AccountingPeriod.is_date_closed(reversal_date):
+            raise ValueError(f"Reversal not allowed: {reversal_date} is in a closed accounting period.")
+
         reversal = JournalEntry.objects.create(
-            date=date or timezone.now().date(),
+            date=reversal_date,
             description=description or f"Reversal of {self.reference or str(self.pk)[:8]}",
             status="draft",
             is_reversal=True,
@@ -338,8 +477,10 @@ class TaxRate(BaseModel):
         """True if this tax rate has been applied to any posted transaction."""
         from django.apps import apps
         sources = [
-            # ("invoicing", "InvoiceLine", "tax_rate_id"),   # add with invoicing app
-            # ("purchase",  "BillLine",    "tax_rate_id"),   # add with purchase app
+            ("sales", "InvoiceLine", "tax_rate_id"),
+            ("sales", "CustomerCreditNoteLine", "tax_rate_id"),
+            ("purchases", "BillLine", "tax_rate_id"),
+            ("purchases", "DebitNoteLine", "tax_rate_id"),
         ]
         for app_label, model_name, field in sources:
             try:
@@ -382,6 +523,17 @@ class JournalEntryLine(BaseModel):
         verbose_name = _("journal entry line")
         verbose_name_plural = _("journal entry lines")
         ordering = ["line_order", "created_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=Q(debit__gte=Decimal("0")) & Q(credit__gte=Decimal("0")),
+                name="jel_non_negative_amounts",
+            ),
+            models.CheckConstraint(
+                check=(Q(debit__gt=Decimal("0")) & Q(credit=Decimal("0")))
+                | (Q(credit__gt=Decimal("0")) & Q(debit=Decimal("0"))),
+                name="jel_exactly_one_side_positive",
+            ),
+        ]
 
     def __str__(self):
         side = f"Dr {self.debit}" if self.debit else f"Cr {self.credit}"
