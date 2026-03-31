@@ -216,10 +216,6 @@ class BillSerializer(serializers.ModelSerializer):
         lines = attrs.get("lines")
         if self.instance is None and (not lines or len(lines) == 0):
             raise serializers.ValidationError({"lines": "At least one bill line is required."})
-        if self.instance is None and not (attrs.get("external_reference") or "").strip():
-            raise serializers.ValidationError(
-                {"external_reference": "external_reference is required for deduplication safety."}
-            )
         return attrs
 
     def create(self, validated_data):

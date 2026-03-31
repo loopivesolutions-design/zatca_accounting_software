@@ -2506,6 +2506,7 @@ All ZATCA compliance violations return HTTP `422 Unprocessable Entity` with a st
 
 ---
 
+
 ## 11. Company Settings
 
 > All endpoints require: `Authorization: Bearer <access_token>` (admin token)  
@@ -3001,7 +3002,7 @@ Organization settings are stored as a **singleton** record. `GET` will auto-crea
 
 ---
 
-## 15. Debit Notes (Purchase)
+START ## 15. Debit Notes (Purchase)
 
 > All endpoints require: `Authorization: Bearer <access_token>`  
 > Base path: `/api/v1/purchases/debit-notes/`
