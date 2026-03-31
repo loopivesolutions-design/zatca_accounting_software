@@ -271,7 +271,13 @@ class BillPostSerializer(serializers.Serializer):
     memo = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
-        bill: Bill = self.context["bill"]
+        bill_id = self.context.get("bill_id") or self.context.get("bill")
+        if isinstance(bill_id, Bill):
+            bill = bill_id
+        else:
+            bill = Bill.objects.filter(pk=bill_id, is_deleted=False).first()
+        if not bill:
+            raise serializers.ValidationError({"error": "NOT_FOUND", "message": "Bill not found."})
         if bill.status == "posted":
             raise serializers.ValidationError({"error": "BILL_ALREADY_POSTED", "message": "Bill already posted."})
         if not bill.lines.filter(is_deleted=False).exists():
