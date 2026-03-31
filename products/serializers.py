@@ -12,6 +12,7 @@ from .models import (
     InventoryAdjustment,
     InventoryAdjustmentLine,
 )
+from accounting.models import Account
 
 
 def _annotate_product_count(qs):
@@ -254,7 +255,11 @@ class ProductSerializer(serializers.ModelSerializer):
 class WarehouseSerializer(serializers.ModelSerializer):
     address_display = serializers.CharField(read_only=True)
     is_locked = serializers.SerializerMethodField()
-    coa_account = serializers.UUIDField(required=False, allow_null=True)
+    coa_account = serializers.PrimaryKeyRelatedField(
+        queryset=Account.objects.all(),
+        required=False,
+        allow_null=True,
+    )
     coa_account_code = serializers.CharField(source="coa_account.code", read_only=True)
     coa_account_name = serializers.CharField(source="coa_account.name", read_only=True)
 
