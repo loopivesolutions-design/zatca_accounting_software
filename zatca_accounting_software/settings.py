@@ -186,8 +186,11 @@ EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'ZATCA Accounting <noreply@zatca.com>')
 
-# ── Backend URL (for invitation links in emails) ──────────────────────────────
-BACKEND_URL = os.getenv('BACKEND_URL', 'http://127.0.0.1:8000')
+# ── Backend URL (for internal use) ────────────────────────────────────────────
+BACKEND_URL = os.getenv('BACKEND_URL', 'https://zatca-backend.loopive.com')
+
+# ── Frontend URL (used in invitation emails so users land on the React app) ───
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://zatca-accounting-software.loopive.com')
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 _cors_origins = os.getenv('CORS_ALLOWED_ORIGINS', '')

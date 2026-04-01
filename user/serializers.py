@@ -175,8 +175,8 @@ class PendingInvitationSerializer(serializers.ModelSerializer):
 
 def send_invitation_email(invitation, invited_by):
     """Shared helper — build and dispatch an invitation email."""
-    backend_url = getattr(django_settings, "BACKEND_URL", "http://127.0.0.1:8000")
-    invite_link = f"{backend_url}/api/v1/user/accept-invitation/?token={invitation.token}"
+    frontend_url = getattr(django_settings, "FRONTEND_URL", "https://zatca-accounting-software.loopive.com").rstrip("/")
+    invite_link = f"{frontend_url}/accept-invitation?token={invitation.token}"
     invited_by_name = invited_by.get_full_name() if invited_by else "ZATCA Team"
     recipient_name = f"{invitation.first_name} {invitation.last_name}".strip() or invitation.email
     role_name = invitation.role.name if invitation.role else "Team Member"
