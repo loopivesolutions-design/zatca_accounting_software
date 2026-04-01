@@ -207,6 +207,16 @@ class BillSerializer(serializers.ModelSerializer):
         ]
 
     def get_status_display(self, obj) -> str:
+        from decimal import Decimal
+        if obj.status in ("paid", "partially_paid"):
+            return dict(BILL_STATUS_CHOICES).get(obj.status, obj.status)
+        if obj.status == "posted":
+            paid = obj.paid_amount or Decimal("0")
+            total = obj.total_amount or Decimal("0")
+            if total > 0 and paid >= total:
+                return "Paid"
+            if paid > 0:
+                return "Partially Paid"
         return dict(BILL_STATUS_CHOICES).get(obj.status, obj.status)
 
     def get_balance_amount(self, obj) -> str:
@@ -326,6 +336,16 @@ class BillListSerializer(serializers.ModelSerializer):
         return obj.lines.filter(is_deleted=False).order_by("line_order", "created_at").first()
 
     def get_status_display(self, obj) -> str:
+        from decimal import Decimal
+        if obj.status in ("paid", "partially_paid"):
+            return dict(BILL_STATUS_CHOICES).get(obj.status, obj.status)
+        if obj.status == "posted":
+            paid = obj.paid_amount or Decimal("0")
+            total = obj.total_amount or Decimal("0")
+            if total > 0 and paid >= total:
+                return "Paid"
+            if paid > 0:
+                return "Partially Paid"
         return dict(BILL_STATUS_CHOICES).get(obj.status, obj.status)
 
     def get_payments(self, obj) -> str:

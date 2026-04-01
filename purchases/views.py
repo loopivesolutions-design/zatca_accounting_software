@@ -17,7 +17,7 @@ from main.management.commands.create_groups_and_permissions import IsAdmin
 from main.idempotency import begin_idempotent, finalize_idempotent_failure, finalize_idempotent_success
 from accounting.permissions import CanPostPurchases
 from accounting.services.posting import post_bill_journal, post_supplier_payment_journal
-from purchases.supplier_payment_posting import apply_supplier_payment_allocations
+from purchases.supplier_payment_posting import apply_supplier_payment_allocations, sync_bill_payment_status
 from .models import (
     Supplier,
     PAYMENT_TERMS_CHOICES,
@@ -501,17 +501,13 @@ class SupplierPaymentDetailAPI(APIView):
         return response
 
     def _rollback_allocations(self, payment: SupplierPayment):
-        for allocation in payment.allocations.filter(is_deleted=False).select_related("bill"):
-            bill = Bill.objects.select_for_update().get(pk=allocation.bill_id)
-            applied_total = bill.payment_allocations.filter(is_deleted=False).aggregate(total=Sum("amount")).get("total")
-            applied_total = (applied_total or Decimal("0")).quantize(Decimal("0.01"))
-            if (bill.paid_amount or Decimal("0")).quantize(Decimal("0.01")) != applied_total:
-                raise ValueError(f"DRIFT_DETECTED: bill {bill.bill_number} paid_amount is out of sync with allocations.")
-            bill.paid_amount = (bill.paid_amount or Decimal("0")) - allocation.amount
-            if bill.paid_amount < 0:
-                bill.paid_amount = Decimal("0")
-            bill.save(update_fields=["paid_amount", "updated_at"])
+        affected_bill_ids = list(
+            payment.allocations.filter(is_deleted=False).values_list("bill_id", flat=True)
+        )
         payment.allocations.filter(is_deleted=False).update(is_deleted=True)
+        for bill_id in affected_bill_ids:
+            bill = Bill.objects.select_for_update().get(pk=bill_id)
+            sync_bill_payment_status(bill)
 
     def _replace_allocations(self, payment: SupplierPayment, allocations, user):
         return SupplierPaymentListCreateAPI()._replace_allocations(payment, allocations, user)

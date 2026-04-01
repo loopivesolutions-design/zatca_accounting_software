@@ -10,6 +10,24 @@ from .models import Bill, SupplierPayment, SupplierPaymentAllocation
 from .serializers import SupplierPaymentSerializer
 
 
+def sync_bill_payment_status(bill: Bill) -> None:
+    """Recompute bill.paid_amount from live allocations and update status accordingly."""
+    total = bill.payment_allocations.filter(is_deleted=False).aggregate(total=Sum("amount")).get("total")
+    paid = (total or Decimal("0")).quantize(Decimal("0.01"))
+    bill.paid_amount = paid
+
+    if bill.status == "posted":
+        total_amount = (bill.total_amount or Decimal("0")).quantize(Decimal("0.01"))
+        if paid >= total_amount and total_amount > 0:
+            bill.status = "paid"
+        elif paid > 0:
+            bill.status = "partially_paid"
+        else:
+            bill.status = "posted"
+
+    bill.save(update_fields=["paid_amount", "status", "updated_at"])
+
+
 def apply_supplier_payment_allocations(payment, allocations, user):
     locked = SupplierPayment.objects.select_for_update().filter(pk=payment.pk, is_deleted=False).first()
     if not locked:
@@ -20,6 +38,7 @@ def apply_supplier_payment_allocations(payment, allocations, user):
     if payment.payment_type == "advance_payment":
         rows = []
 
+    affected_bills = []
     for row in rows:
         bill_id = row.get("bill")
         amount = Decimal(str(row.get("amount", "0")))
@@ -30,8 +49,6 @@ def apply_supplier_payment_allocations(payment, allocations, user):
             raise ValueError(f"Invalid bill: {bill_id}")
         applied_total = bill.payment_allocations.filter(is_deleted=False).aggregate(total=Sum("amount")).get("total")
         applied_total = (applied_total or Decimal("0")).quantize(Decimal("0.01"))
-        if (bill.paid_amount or Decimal("0")).quantize(Decimal("0.01")) != applied_total:
-            raise ValueError(f"DRIFT_DETECTED: bill {bill.bill_number} paid_amount is out of sync with allocations.")
         AllocationValidator.validate_supplier_payment_bill(bill, payment)
         if amount > bill.balance_amount:
             raise ValueError(f"Applied amount exceeds current bill balance for {bill.bill_number}.")
@@ -42,9 +59,11 @@ def apply_supplier_payment_allocations(payment, allocations, user):
             amount=amount,
             creator=user,
         )
-        bill.paid_amount = (bill.paid_amount or Decimal("0")) + amount
-        bill.save(update_fields=["paid_amount", "updated_at"])
         total_applied += amount
+        affected_bills.append(bill)
+
+    for bill in affected_bills:
+        sync_bill_payment_status(bill)
 
     if total_applied > payment.amount_paid:
         raise ValueError("Total applied amount cannot exceed amount_paid.")

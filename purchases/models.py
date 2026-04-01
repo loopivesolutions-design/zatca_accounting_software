@@ -111,6 +111,8 @@ class Supplier(BaseModel):
 BILL_STATUS_CHOICES = (
     ("draft", "Draft"),
     ("posted", "Posted"),
+    ("partially_paid", "Partially Paid"),
+    ("paid", "Paid"),
 )
 
 SUPPLIER_PAYMENT_TYPE_CHOICES = (
@@ -158,7 +160,7 @@ class Bill(BaseModel):
     )
     status = models.CharField(
         _("Status"),
-        max_length=10,
+        max_length=16,
         choices=BILL_STATUS_CHOICES,
         default="draft",
         db_index=True,
