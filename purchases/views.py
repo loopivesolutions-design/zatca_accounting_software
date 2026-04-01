@@ -7,6 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q, Sum
 from django.db import transaction
+from django.db import DatabaseError
 from rest_framework.pagination import PageNumberPagination
 from decimal import Decimal
 
@@ -18,6 +19,11 @@ from main.idempotency import begin_idempotent, finalize_idempotent_failure, fina
 from accounting.permissions import CanPostPurchases
 from accounting.services.posting import post_bill_journal, post_supplier_payment_journal
 from purchases.supplier_payment_posting import apply_supplier_payment_allocations, sync_bill_payment_status
+from purchases.supplier_refund_posting import (
+    apply_supplier_refund_allocations,
+    rollback_supplier_refund_allocations,
+    create_supplier_refund_from_payload,
+)
 from .models import (
     Supplier,
     PAYMENT_TERMS_CHOICES,
@@ -28,6 +34,7 @@ from .models import (
     SupplierPaymentAllocation,
     SUPPLIER_PAYMENT_TYPE_CHOICES,
     DebitNote,
+    SupplierRefund,
 )
 from .serializers import (
     SupplierSerializer,
@@ -36,6 +43,7 @@ from .serializers import (
     BillListSerializer,
     SupplierPaymentSerializer,
     DebitNoteSerializer,
+    SupplierRefundSerializer,
 )
 
 
@@ -250,7 +258,7 @@ class BillDetailAPI(APIView):
             bill = Bill.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
             if not bill:
                 return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Bill not found.", http_status=404)  # type: ignore[arg-type]
-            if bill.status == "posted":
+            if bill.status in ("posted", "partially_paid", "paid"):
                 return finalize_idempotent_failure(
                     rec,  # type: ignore[arg-type]
                     error="BILL_POSTED",
@@ -286,7 +294,7 @@ class BillPostAPI(APIView):
                 return finalize_idempotent_failure(  # type: ignore[arg-type]
                     rec, error="NOT_FOUND", message="Bill not found.", http_status=404
                 )
-            if bill.status == "posted":
+            if bill.status in ("posted", "partially_paid", "paid"):
                 response = Response(BillSerializer(bill).data, status=status.HTTP_200_OK)
                 finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                 return response
@@ -407,7 +415,7 @@ class SupplierPaymentListCreateAPI(APIView):
                 payment.journal_entry = je
                 payment.save(update_fields=["journal_entry", "updated_at"])
                 payment.refresh_from_db()
-        except ValueError as exc:
+        except (ValueError, DatabaseError) as exc:
             return finalize_idempotent_failure(
                 rec,  # type: ignore[arg-type]
                 error="VALIDATION_ERROR",
@@ -463,7 +471,7 @@ class SupplierPaymentDetailAPI(APIView):
                 if allocations is not None:
                     self._replace_allocations(payment, allocations, user=request.user)
                 payment.refresh_from_db()
-        except ValueError as exc:
+        except (ValueError, DatabaseError) as exc:
             return finalize_idempotent_failure(
                 rec,  # type: ignore[arg-type]
                 error="VALIDATION_ERROR",
@@ -530,7 +538,7 @@ class SupplierOutstandingBillsAPI(APIView):
 
         bills = Bill.objects.filter(
             is_deleted=False,
-            status="posted",
+            status__in=("posted", "partially_paid"),
             supplier_id=supplier_id,
         ).order_by("bill_date", "created_at")
 
@@ -641,3 +649,189 @@ class DebitNoteDetailAPI(APIView):
         note.is_deleted = True
         note.save(update_fields=["is_deleted", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Supplier Refunds ──────────────────────────────────────────────────────────
+
+class SupplierRefundPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+def _get_supplier_refund(pk):
+    try:
+        return SupplierRefund.objects.get(pk=pk, is_deleted=False)
+    except SupplierRefund.DoesNotExist:
+        return None
+
+
+class SupplierRefundListCreateAPI(APIView):
+    """
+    GET  /purchases/supplier-refunds/
+    POST /purchases/supplier-refunds/
+    """
+
+    permission_classes = [IsAuthenticated, CanPostPurchases]
+    pagination_class = SupplierRefundPagination
+
+    def get(self, request):
+        qs = SupplierRefund.objects.filter(is_deleted=False).select_related("supplier", "paid_through")
+        search = request.query_params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(refund_number__icontains=search)
+                | Q(supplier__company_name__icontains=search)
+                | Q(description__icontains=search)
+            )
+        supplier_id = request.query_params.get("supplier")
+        if supplier_id:
+            qs = qs.filter(supplier_id=supplier_id)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs, request)
+        return paginator.get_paginated_response(SupplierRefundSerializer(page, many=True).data)
+
+    def post(self, request):
+        rec, early = begin_idempotent(request, scope="purchases.supplier_refund.create")
+        if early:
+            return early
+
+        allocations = request.data.get("allocations", [])
+
+        serializer = SupplierRefundSerializer(data={k: v for k, v in request.data.items() if k != "allocations"})
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            with transaction.atomic():
+                refund = serializer.save(creator=request.user)
+                apply_supplier_refund_allocations(refund, allocations, user=request.user)
+                from accounting.services.posting import post_supplier_refund_journal
+                je = post_supplier_refund_journal(refund=refund, user=request.user)
+                refund.journal_entry = je
+                refund.save(update_fields=["journal_entry", "updated_at"])
+                refund.refresh_from_db()
+        except (ValueError, DatabaseError) as exc:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        response = Response(SupplierRefundSerializer(refund).data, status=status.HTTP_201_CREATED)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
+
+
+class SupplierRefundDetailAPI(APIView):
+    """
+    GET/PATCH/DELETE /purchases/supplier-refunds/<uuid>/
+    """
+
+    permission_classes = [IsAuthenticated, CanPostPurchases]
+
+    def get(self, request, pk):
+        refund = _get_supplier_refund(pk)
+        if not refund:
+            return Response({"error": "NOT_FOUND", "message": "Supplier refund not found."}, status=404)
+        return Response(SupplierRefundSerializer(refund).data)
+
+    def patch(self, request, pk):
+        rec, early = begin_idempotent(request, scope="purchases.supplier_refund.update")
+        if early:
+            return early
+
+        allocations = request.data.get("allocations", None)
+        try:
+            with transaction.atomic():
+                refund = SupplierRefund.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+                if not refund:
+                    return finalize_idempotent_failure(
+                        rec, error="NOT_FOUND", message="Supplier refund not found.", http_status=404  # type: ignore[arg-type]
+                    )
+                if refund.is_posted:
+                    return finalize_idempotent_failure(
+                        rec,  # type: ignore[arg-type]
+                        error="REFUND_POSTED",
+                        message="Posted refund cannot be edited.",
+                        http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+                serializer = SupplierRefundSerializer(refund, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
+                rollback_supplier_refund_allocations(refund)
+                refund = serializer.save(updator=request.user)
+                if allocations is not None:
+                    apply_supplier_refund_allocations(refund, allocations, user=request.user)
+                refund.refresh_from_db()
+        except (ValueError, DatabaseError) as exc:
+            return finalize_idempotent_failure(
+                rec,  # type: ignore[arg-type]
+                error="VALIDATION_ERROR",
+                message=str(exc),
+                http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        response = Response(SupplierRefundSerializer(refund).data)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
+
+    def delete(self, request, pk):
+        rec, early = begin_idempotent(request, scope="purchases.supplier_refund.delete")
+        if early:
+            return early
+
+        with transaction.atomic():
+            refund = SupplierRefund.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+            if not refund:
+                return finalize_idempotent_failure(
+                    rec, error="NOT_FOUND", message="Supplier refund not found.", http_status=404  # type: ignore[arg-type]
+                )
+            if refund.is_posted:
+                return finalize_idempotent_failure(
+                    rec,  # type: ignore[arg-type]
+                    error="REFUND_POSTED",
+                    message="Posted refund cannot be deleted.",
+                    http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+            rollback_supplier_refund_allocations(refund)
+            refund.is_deleted = True
+            refund.save(update_fields=["is_deleted", "updated_at"])
+
+        response = Response(status=status.HTTP_204_NO_CONTENT)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
+
+
+class SupplierOutstandingDebitNotesAPI(APIView):
+    """
+    GET /purchases/supplier-refunds/outstanding-debit-notes/?supplier=<uuid>
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        supplier_id = request.query_params.get("supplier")
+        if not supplier_id:
+            return Response(
+                {"error": "SUPPLIER_REQUIRED", "message": "supplier query param is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        notes = DebitNote.objects.filter(
+            is_deleted=False,
+            status="posted",
+            supplier_id=supplier_id,
+        ).order_by("date", "created_at")
+
+        results = []
+        for note in notes:
+            balance = note.balance_amount
+            if balance <= 0:
+                continue
+            results.append({
+                "id": str(note.id),
+                "debit_note_number": note.debit_note_number,
+                "date": note.date,
+                "total_amount": str(note.total_amount),
+                "refunded_amount": str(note.refunded_amount),
+                "balance_amount": str(balance),
+            })
+        return Response({"results": results})

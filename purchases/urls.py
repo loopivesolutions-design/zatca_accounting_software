@@ -12,6 +12,9 @@ from .views import (
     SupplierOutstandingBillsAPI,
     DebitNoteListCreateAPI,
     DebitNoteDetailAPI,
+    SupplierRefundListCreateAPI,
+    SupplierRefundDetailAPI,
+    SupplierOutstandingDebitNotesAPI,
 )
 
 app_name = "purchases"
@@ -28,5 +31,7 @@ urlpatterns = [
     path("supplier-payments/outstanding-bills/", SupplierOutstandingBillsAPI.as_view(), name="supplier-outstanding-bills"),
     path("debit-notes/", DebitNoteListCreateAPI.as_view(), name="debit-note-list-create"),
     path("debit-notes/<uuid:pk>/", DebitNoteDetailAPI.as_view(), name="debit-note-detail"),
+    path("supplier-refunds/", SupplierRefundListCreateAPI.as_view(), name="supplier-refund-list-create"),
+    path("supplier-refunds/<uuid:pk>/", SupplierRefundDetailAPI.as_view(), name="supplier-refund-detail"),
+    path("supplier-refunds/outstanding-debit-notes/", SupplierOutstandingDebitNotesAPI.as_view(), name="supplier-outstanding-debit-notes"),
 ]
-

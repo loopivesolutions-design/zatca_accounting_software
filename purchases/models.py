@@ -377,13 +377,25 @@ class DebitNote(BaseModel):
     subtotal = models.DecimalField(_("Subtotal"), max_digits=18, decimal_places=2, default=Decimal("0"))
     total_vat = models.DecimalField(_("Total VAT"), max_digits=18, decimal_places=2, default=Decimal("0"))
     total_amount = models.DecimalField(_("Total Amount"), max_digits=18, decimal_places=2, default=Decimal("0"))
+    refunded_amount = models.DecimalField(_("Refunded Amount"), max_digits=18, decimal_places=2, default=Decimal("0"))
 
     class Meta:
         db_table = "purchase_debit_note"
         ordering = ["-date", "-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=Q(refunded_amount__gte=0) & Q(refunded_amount__lte=F("total_amount")),
+                name="debit_note_refunded_lte_total_nonneg",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.debit_note_number
+
+    @property
+    def balance_amount(self) -> Decimal:
+        balance = (self.total_amount or Decimal("0")) - (self.refunded_amount or Decimal("0"))
+        return balance if balance > 0 else Decimal("0")
 
     def recalculate_totals(self) -> None:
         lines = self.lines.filter(is_deleted=False)
@@ -452,3 +464,69 @@ class DebitNoteLine(BaseModel):
         strat = (strategy or get_vat_rounding_strategy()).strip().lower()
         vat = self.tax_amount(strategy=strat)
         return money(self.subtotal() + (money(vat) if strat == "invoice" else vat))
+
+
+class SupplierRefund(BaseModel):
+    refund_number = models.CharField(_("Refund Number"), max_length=30, unique=True, db_index=True)
+    supplier = models.ForeignKey(
+        "purchases.Supplier",
+        on_delete=models.PROTECT,
+        related_name="refunds",
+        verbose_name=_("Supplier"),
+    )
+    paid_through = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.PROTECT,
+        related_name="supplier_refunds",
+        verbose_name=_("Paid Through"),
+        help_text=_("Cash/Bank account used for refund."),
+    )
+    amount_refunded = models.DecimalField(_("Amount Refunded"), max_digits=18, decimal_places=2, default=Decimal("0"))
+    refund_date = models.DateField(_("Refund Date"), db_index=True)
+    description = models.TextField(_("Description"), blank=True)
+    is_posted = models.BooleanField(_("Posted"), default=True, db_index=True)
+    journal_entry = models.OneToOneField(
+        "accounting.JournalEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_supplier_refund",
+        verbose_name=_("Journal Entry"),
+    )
+
+    class Meta:
+        db_table = "supplier_refund"
+        ordering = ["-refund_date", "-created_at"]
+
+    def __str__(self) -> str:
+        return self.refund_number
+
+    @property
+    def amount_applied(self) -> Decimal:
+        total = self.allocations.filter(is_deleted=False).aggregate(total=models.Sum("amount")).get("total")
+        return total or Decimal("0")
+
+    @property
+    def remaining_amount(self) -> Decimal:
+        remaining = (self.amount_refunded or Decimal("0")) - self.amount_applied
+        return remaining if remaining > 0 else Decimal("0")
+
+
+class SupplierRefundAllocation(BaseModel):
+    refund = models.ForeignKey(
+        "purchases.SupplierRefund",
+        on_delete=models.PROTECT,
+        related_name="allocations",
+        verbose_name=_("Supplier Refund"),
+    )
+    debit_note = models.ForeignKey(
+        "purchases.DebitNote",
+        on_delete=models.PROTECT,
+        related_name="refund_allocations",
+        verbose_name=_("Debit Note"),
+    )
+    amount = models.DecimalField(_("Amount Applied"), max_digits=18, decimal_places=2, default=Decimal("0"))
+
+    class Meta:
+        db_table = "supplier_refund_allocation"
+        ordering = ["created_at"]

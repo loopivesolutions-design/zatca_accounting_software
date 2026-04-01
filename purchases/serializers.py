@@ -16,6 +16,8 @@ from .models import (
     DebitNote,
     DebitNoteLine,
     DEBIT_NOTE_STATUS_CHOICES,
+    SupplierRefund,
+    SupplierRefundAllocation,
 )
 
 
@@ -250,7 +252,7 @@ class BillSerializer(serializers.ModelSerializer):
         user = request.user if request else None
         lines_data = validated_data.pop("lines", None)
 
-        if instance.status == "posted":
+        if instance.status in ("posted", "partially_paid", "paid"):
             raise serializers.ValidationError(
                 {"error": "BILL_POSTED", "message": "Posted bill cannot be edited."}
             )
@@ -288,7 +290,7 @@ class BillPostSerializer(serializers.Serializer):
             bill = Bill.objects.filter(pk=bill_id, is_deleted=False).first()
         if not bill:
             raise serializers.ValidationError({"error": "NOT_FOUND", "message": "Bill not found."})
-        if bill.status == "posted":
+        if bill.status in ("posted", "partially_paid", "paid"):
             raise serializers.ValidationError({"error": "BILL_ALREADY_POSTED", "message": "Bill already posted."})
         if not bill.lines.filter(is_deleted=False).exists():
             raise serializers.ValidationError({"error": "NO_LINES", "message": "Bill must include at least one line."})
@@ -587,4 +589,75 @@ class DebitNoteSerializer(serializers.ModelSerializer):
                 )
         instance.recalculate_totals()
         return instance
+
+
+class SupplierRefundAllocationSerializer(serializers.ModelSerializer):
+    debit_note_number = serializers.CharField(source="debit_note.debit_note_number", read_only=True)
+    debit_note_date = serializers.DateField(source="debit_note.date", read_only=True)
+    debit_note_total = serializers.DecimalField(source="debit_note.total_amount", max_digits=18, decimal_places=2, read_only=True)
+    debit_note_balance = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierRefundAllocation
+        fields = ["id", "debit_note", "debit_note_number", "debit_note_date", "debit_note_total", "debit_note_balance", "amount"]
+        read_only_fields = ["id", "debit_note_number", "debit_note_date", "debit_note_total", "debit_note_balance"]
+
+    def get_debit_note_balance(self, obj) -> str:
+        return str(obj.debit_note.balance_amount)
+
+
+class SupplierRefundSerializer(serializers.ModelSerializer):
+    supplier_name = serializers.CharField(source="supplier.company_name", read_only=True)
+    paid_through_code = serializers.CharField(source="paid_through.code", read_only=True)
+    paid_through_name = serializers.CharField(source="paid_through.name", read_only=True)
+    amount_applied = serializers.SerializerMethodField()
+    remaining_amount = serializers.SerializerMethodField()
+    allocations = SupplierRefundAllocationSerializer(many=True, required=False, read_only=True)
+
+    class Meta:
+        model = SupplierRefund
+        fields = [
+            "id",
+            "refund_number",
+            "supplier",
+            "supplier_name",
+            "paid_through",
+            "paid_through_code",
+            "paid_through_name",
+            "amount_refunded",
+            "refund_date",
+            "description",
+            "is_posted",
+            "journal_entry",
+            "amount_applied",
+            "remaining_amount",
+            "allocations",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "supplier_name",
+            "paid_through_code",
+            "paid_through_name",
+            "amount_applied",
+            "remaining_amount",
+            "journal_entry",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_amount_applied(self, obj) -> str:
+        return str(obj.amount_applied)
+
+    def get_remaining_amount(self, obj) -> str:
+        return str(obj.remaining_amount)
+
+    def validate(self, attrs):
+        amount_refunded = attrs.get("amount_refunded")
+        if amount_refunded is None and self.instance is not None:
+            amount_refunded = self.instance.amount_refunded
+        if amount_refunded is None or float(amount_refunded) <= 0:
+            raise serializers.ValidationError({"amount_refunded": "Amount refunded must be greater than 0."})
+        return attrs
 

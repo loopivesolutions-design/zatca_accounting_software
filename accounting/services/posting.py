@@ -260,6 +260,37 @@ def post_customer_payment_journal(*, payment, user):
     return je
 
 
+def post_supplier_refund_journal(*, refund, user):
+    _assert_open_period(refund.refund_date)
+    ap_account = get_system_account("ACCOUNTS_PAYABLE", fallback_code="211")
+    je = JournalEntry.objects.create(
+        date=refund.refund_date,
+        description=f"Supplier Refund {refund.refund_number}",
+        status="draft",
+        creator=user,
+    )
+    JournalEntryLine.objects.create(
+        journal_entry=je,
+        account=refund.paid_through,
+        description=f"Cash/Bank receipt {refund.refund_number}",
+        debit=refund.amount_refunded,
+        credit=Decimal("0"),
+        line_order=0,
+        creator=user,
+    )
+    JournalEntryLine.objects.create(
+        journal_entry=je,
+        account=ap_account,
+        description=f"Accounts Payable refund {refund.refund_number}",
+        debit=Decimal("0"),
+        credit=refund.amount_refunded,
+        line_order=1,
+        creator=user,
+    )
+    _post_journal(je)
+    return je
+
+
 def post_customer_refund_journal(*, refund, user):
     _assert_open_period(refund.refund_date)
     ar_account = get_system_account("ACCOUNTS_RECEIVABLE", fallback_code="112")

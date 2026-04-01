@@ -15,7 +15,7 @@ Endpoints
 
 import uuid as uuid_lib
 
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import Q
 from rest_framework import status
 from rest_framework.pagination import PageNumberPagination
@@ -191,7 +191,16 @@ class WarehouseListCreateAPI(APIView):
     def post(self, request):
         serializer = WarehouseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        wh = serializer.save(creator=request.user)
+        try:
+            wh = serializer.save(creator=request.user)
+        except IntegrityError as exc:
+            msg = str(exc)
+            if "coa_account" in msg:
+                return Response(
+                    {"coa_account": ["This account is already linked to another warehouse."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            raise
         return Response(WarehouseSerializer(wh).data, status=status.HTTP_201_CREATED)
 
 
@@ -212,7 +221,16 @@ class WarehouseDetailAPI(APIView):
             return Response({"error": "NOT_FOUND", "message": "Warehouse not found."}, status=404)
         serializer = WarehouseSerializer(wh, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        wh = serializer.save(updator=request.user)
+        try:
+            wh = serializer.save(updator=request.user)
+        except IntegrityError as exc:
+            msg = str(exc)
+            if "coa_account" in msg:
+                return Response(
+                    {"coa_account": ["This account is already linked to another warehouse."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            raise
         return Response(WarehouseSerializer(wh).data)
 
     def delete(self, request, pk):

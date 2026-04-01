@@ -84,7 +84,7 @@ class AllocationValidator:
 
     @classmethod
     def validate_supplier_payment_bill(cls, bill, payment) -> None:
-        if bill.status != "posted":
+        if bill.status not in ("posted", "partially_paid"):
             raise ValueError(f"Bill {bill.bill_number} must be posted before payment.")
         if bill.supplier_id != payment.supplier_id:
             raise ValueError("Bill supplier must match payment supplier.")

@@ -293,6 +293,20 @@ class WarehouseSerializer(serializers.ModelSerializer):
     def get_is_locked(self, obj) -> bool:
         return obj.has_transactions()
 
+    def validate_coa_account(self, value):
+        if value is None:
+            return value
+        from .models import Warehouse
+        qs = Warehouse.objects.filter(coa_account=value, is_deleted=False)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                "This account is already linked to another warehouse. "
+                "Each account can only be assigned to one warehouse."
+            )
+        return value
+
 
 class InventoryAdjustmentLineSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
