@@ -224,6 +224,13 @@ class BillSerializer(serializers.ModelSerializer):
     def get_balance_amount(self, obj) -> str:
         return str(obj.balance_amount)
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["lines"] = BillLineSerializer(
+            instance.lines.filter(is_deleted=False), many=True
+        ).data
+        return ret
+
     def validate(self, attrs):
         lines = attrs.get("lines")
         if self.instance is None and (not lines or len(lines) == 0):
@@ -542,6 +549,13 @@ class DebitNoteSerializer(serializers.ModelSerializer):
 
     def get_status_display(self, obj) -> str:
         return dict(DEBIT_NOTE_STATUS_CHOICES).get(obj.status, obj.status)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["lines"] = DebitNoteLineSerializer(
+            instance.lines.filter(is_deleted=False), many=True
+        ).data
+        return ret
 
     def validate(self, attrs):
         lines = attrs.get("lines")

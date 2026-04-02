@@ -222,6 +222,13 @@ class QuoteSerializer(serializers.ModelSerializer):
             "logo": settings_obj.logo.url if settings_obj.logo else None,
         }
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["lines"] = QuoteLineSerializer(
+            instance.lines.filter(is_deleted=False), many=True
+        ).data
+        return ret
+
     def validate(self, attrs):
         lines = attrs.get("lines")
         if self.instance is None and (not lines or len(lines) == 0):
@@ -387,6 +394,13 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "vat_registration_number": settings_obj.vat_registration_number,
             "logo": settings_obj.logo.url if settings_obj.logo else None,
         }
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["lines"] = InvoiceLineSerializer(
+            instance.lines.filter(is_deleted=False), many=True
+        ).data
+        return ret
 
     def validate(self, attrs):
         lines = attrs.get("lines")
@@ -649,6 +663,13 @@ class CustomerCreditNoteSerializer(serializers.ModelSerializer):
             "vat_registration_number": settings_obj.vat_registration_number,
             "logo": settings_obj.logo.url if settings_obj.logo else None,
         }
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["lines"] = CustomerCreditNoteLineSerializer(
+            instance.lines.filter(is_deleted=False), many=True
+        ).data
+        return ret
 
     def validate(self, attrs):
         lines = attrs.get("lines")
