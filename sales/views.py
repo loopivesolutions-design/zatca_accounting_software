@@ -718,7 +718,7 @@ class CustomerOutstandingInvoicesAPI(APIView):
 
         invoices = Invoice.objects.filter(
             is_deleted=False,
-            status="posted",
+            status__in=["posted", "partially_paid", "overdue"],
             customer_id=customer_id,
         ).order_by("date", "created_at")
 
@@ -731,7 +731,7 @@ class CustomerOutstandingInvoicesAPI(APIView):
                 {
                     "id": str(invoice.id),
                     "invoice_number": invoice.invoice_number,
-                    "invoice_date": invoice.date,
+                    "date": str(invoice.date),
                     "total_amount": str(invoice.total_amount),
                     "paid_amount": str(invoice.paid_amount),
                     "balance_amount": str(balance),
