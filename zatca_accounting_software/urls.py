@@ -29,6 +29,6 @@ urlpatterns = [
     path("api/v1/sales/", include("sales.urls", namespace="sales")),
 ]
 
-# Serve media files (product images, etc.) during development
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Serve media files via Django (works in both development and production).
+# For high-traffic deployments, offload this to nginx with an alias for MEDIA_ROOT.
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
