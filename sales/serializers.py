@@ -77,7 +77,28 @@ class CustomerSerializer(serializers.ModelSerializer):
     def get_opening_balance_type_display(self, obj) -> str:
         return dict(CUSTOMER_OPENING_BALANCE_CHOICES).get(obj.opening_balance_type, obj.opening_balance_type)
 
+    def validate_tax_registration_number(self, value):
+        import re
+        if not value:
+            return value
+        if not re.fullmatch(r'3\d{13}3', value):
+            raise serializers.ValidationError(
+                "Tax Registration Number must be exactly 15 digits, starting and ending with 3."
+            )
+        return value
+
     def validate(self, attrs):
+        vat_treatment = attrs.get("vat_treatment")
+        if vat_treatment is None and self.instance is not None:
+            vat_treatment = self.instance.vat_treatment
+        trn = attrs.get("tax_registration_number")
+        if trn is None and self.instance is not None:
+            trn = self.instance.tax_registration_number
+        if vat_treatment == "vat_registered_ksa" and not trn:
+            raise serializers.ValidationError(
+                {"tax_registration_number": "Tax Registration Number is required for VAT-registered customers."}
+            )
+
         opening_type = attrs.get("opening_balance_type")
         if opening_type is None and self.instance is not None:
             opening_type = self.instance.opening_balance_type
