@@ -673,7 +673,10 @@ class CustomerCreditNotePostSerializer(serializers.Serializer):
     qr_code_text = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
-        note: CustomerCreditNote = self.context["credit_note"]
+        credit_note_id = self.context.get("credit_note_id")
+        note = CustomerCreditNote.objects.filter(pk=credit_note_id, is_deleted=False).first() if credit_note_id else None
+        if not note:
+            raise serializers.ValidationError({"error": "NOT_FOUND", "message": "Credit note not found."})
         if note.status == "posted":
             raise serializers.ValidationError(
                 {"error": "CREDIT_NOTE_ALREADY_POSTED", "message": "Credit note already posted."}
