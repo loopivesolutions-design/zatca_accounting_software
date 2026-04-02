@@ -165,8 +165,9 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-# Media (user-uploaded) files — used for product images, etc.
-MEDIA_URL = '/media/'
+# Media (user-uploaded) files — served under /api/v1/media/ so nginx proxies
+# it to Django (nginx blocks the bare /media/ path in production).
+MEDIA_URL = '/api/v1/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 # Default primary key field type

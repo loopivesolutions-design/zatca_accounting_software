@@ -29,6 +29,6 @@ urlpatterns = [
     path("api/v1/sales/", include("sales.urls", namespace="sales")),
 ]
 
-# Serve media files via Django (works in both development and production).
-# For high-traffic deployments, offload this to nginx with an alias for MEDIA_ROOT.
+# Serve media files via Django at /api/v1/media/ so nginx proxies it correctly.
+# Nginx blocks bare /media/ in production; routing through /api/v1/ avoids that.
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
