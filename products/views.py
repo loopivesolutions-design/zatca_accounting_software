@@ -184,6 +184,15 @@ class WarehouseListCreateAPI(APIView):
 
     def get(self, request):
         qs = Warehouse.objects.filter(is_deleted=False).order_by("name")
+        q = (request.query_params.get("search") or "").strip()
+        if q:
+            qs = qs.filter(
+                Q(name__icontains=q)
+                | Q(name_ar__icontains=q)
+                | Q(code__icontains=q)
+                | Q(city__icontains=q)
+                | Q(phone__icontains=q)
+            )
         paginator = CustomPagination()
         page = paginator.paginate_queryset(qs, request)
         return paginator.get_paginated_response(WarehouseSerializer(page, many=True).data)
