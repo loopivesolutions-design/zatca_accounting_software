@@ -39,7 +39,9 @@ QUOTE_STATUS_CHOICES = (
 
 INVOICE_STATUS_CHOICES = (
     ("draft", "Draft"),
-    ("posted", "Posted"),
+    ("confirmed", "Confirmed"),
+    ("posted", "Posted"),        # legacy — kept for backward compatibility
+    ("reported", "Reported"),
     ("paid", "Paid"),
     ("partially_paid", "Partially Paid"),
     ("overdue", "Overdue"),
@@ -75,7 +77,9 @@ CUSTOMER_PAYMENT_TYPE_CHOICES = (
 
 CUSTOMER_CREDIT_NOTE_STATUS_CHOICES = (
     ("draft", "Draft"),
-    ("posted", "Posted"),
+    ("confirmed", "Confirmed"),
+    ("posted", "Posted"),        # legacy — kept for backward compatibility
+    ("reported", "Reported"),
 )
 
 
@@ -367,8 +371,8 @@ class Invoice(ZatcaHashSealMixin, BaseModel):
         ordering = ["-date", "-created_at"]
         constraints = [
             models.CheckConstraint(
-                check=~models.Q(status="posted") | models.Q(journal_entry__isnull=False),
-                name="invoice_posted_requires_journal_entry",
+                check=~models.Q(status__in=["posted", "reported"]) | models.Q(journal_entry__isnull=False),
+                name="invoice_posted_reported_requires_journal_entry",
             ),
             models.CheckConstraint(
                 check=Q(paid_amount__gte=0) & Q(paid_amount__lte=F("total_amount")),
@@ -616,8 +620,8 @@ class CustomerCreditNote(ZatcaHashSealMixin, BaseModel):
         ordering = ["-date", "-created_at"]
         constraints = [
             models.CheckConstraint(
-                check=~models.Q(status="posted") | models.Q(journal_entry__isnull=False),
-                name="credit_note_posted_requires_journal_entry",
+                check=~models.Q(status__in=["posted", "reported"]) | models.Q(journal_entry__isnull=False),
+                name="credit_note_posted_reported_requires_journal_entry",
             ),
             models.CheckConstraint(
                 check=Q(refunded_amount__gte=0) & Q(refunded_amount__lte=F("total_amount")),

@@ -229,6 +229,11 @@ ZATCA_BLOCK_POST_ON_CHAIN_FAILURE = _env_bool(
 # Optional TLV tags 7–9 (ECDSA) in QR — enable only when your certification profile requires them.
 ZATCA_QR_INCLUDE_ECDSA = _env_bool("ZATCA_QR_INCLUDE_ECDSA", default=False)
 
+# When False, invoice/credit-note posting builds unsigned XML artifacts but does NOT require a
+# ZATCA certificate.  Signing + submission to Fatoora happens later via the "Report to Fatoora"
+# button (a dedicated API call).  Set to True only after your ZATCA certificate is onboarded.
+ZATCA_SIGNING_ENABLED = _env_bool("ZATCA_SIGNING_ENABLED", default=False)
+
 # ZATCA API simulation (no HTTP to authority). Unset env → True when DEBUG=True, False when DEBUG=False.
 _zat_sim = (os.getenv("ZATCA_SIMULATION_MODE", "") or "").strip().lower()
 if _zat_sim in {"1", "true", "yes", "on"}:

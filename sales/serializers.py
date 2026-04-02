@@ -426,9 +426,9 @@ class InvoiceSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         user = request.user if request else None
         lines_data = validated_data.pop("lines", None)
-        if instance.status == "posted":
+        if instance.status in ("confirmed", "posted", "reported"):
             raise serializers.ValidationError(
-                {"error": "INVOICE_POSTED", "message": "Posted invoice cannot be edited."}
+                {"error": "INVOICE_LOCKED", "message": "Invoice cannot be edited after it has been confirmed."}
             )
         for key, value in validated_data.items():
             setattr(instance, key, value)
@@ -450,9 +450,9 @@ class InvoicePostSerializer(serializers.Serializer):
         invoice = Invoice.objects.filter(pk=invoice_id, is_deleted=False).first() if invoice_id else None
         if not invoice:
             raise serializers.ValidationError({"error": "NOT_FOUND", "message": "Invoice not found."})
-        if invoice.status == "posted":
+        if invoice.status in ("confirmed", "posted", "reported"):
             raise serializers.ValidationError(
-                {"error": "INVOICE_ALREADY_POSTED", "message": "Invoice already posted."}
+                {"error": "INVOICE_ALREADY_CONFIRMED", "message": "Invoice is already confirmed."}
             )
         if not invoice.lines.filter(is_deleted=False).exists():
             raise serializers.ValidationError({"error": "NO_LINES", "message": "Invoice must include at least one line."})
@@ -695,9 +695,9 @@ class CustomerCreditNoteSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         user = request.user if request else None
         lines_data = validated_data.pop("lines", None)
-        if instance.status == "posted":
+        if instance.status in ("confirmed", "posted", "reported"):
             raise serializers.ValidationError(
-                {"error": "CREDIT_NOTE_POSTED", "message": "Posted credit note cannot be edited."}
+                {"error": "CREDIT_NOTE_LOCKED", "message": "Credit note cannot be edited after it has been confirmed."}
             )
         for key, value in validated_data.items():
             setattr(instance, key, value)
@@ -719,9 +719,9 @@ class CustomerCreditNotePostSerializer(serializers.Serializer):
         note = CustomerCreditNote.objects.filter(pk=credit_note_id, is_deleted=False).first() if credit_note_id else None
         if not note:
             raise serializers.ValidationError({"error": "NOT_FOUND", "message": "Credit note not found."})
-        if note.status == "posted":
+        if note.status in ("confirmed", "posted", "reported"):
             raise serializers.ValidationError(
-                {"error": "CREDIT_NOTE_ALREADY_POSTED", "message": "Credit note already posted."}
+                {"error": "CREDIT_NOTE_ALREADY_CONFIRMED", "message": "Credit note is already confirmed."}
             )
         if not note.lines.filter(is_deleted=False).exists():
             raise serializers.ValidationError(

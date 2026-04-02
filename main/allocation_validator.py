@@ -64,8 +64,8 @@ class AllocationValidator:
 
     @classmethod
     def validate_customer_payment_invoice(cls, invoice, payment) -> None:
-        if invoice.status != "posted":
-            raise ValueError(f"Invoice {invoice.invoice_number} must be posted before payment.")
+        if invoice.status not in ("posted", "reported"):
+            raise ValueError(f"Invoice {invoice.invoice_number} must be reported to Fatoora before payment.")
         if invoice.customer_id != payment.customer_id:
             raise ValueError("Invoice customer must match payment customer.")
         cls._validate_currency_match(invoice, payment, doc_label="Invoice")
@@ -74,8 +74,8 @@ class AllocationValidator:
 
     @classmethod
     def validate_customer_refund_credit_note(cls, credit_note, refund) -> None:
-        if credit_note.status != "posted":
-            raise ValueError(f"Credit note {credit_note.credit_note_number} must be posted before refund.")
+        if credit_note.status not in ("posted", "reported"):
+            raise ValueError(f"Credit note {credit_note.credit_note_number} must be reported to Fatoora before refund.")
         if credit_note.customer_id != refund.customer_id:
             raise ValueError("Credit note customer must match refund customer.")
         cls._validate_currency_match(credit_note, refund, doc_label="Credit note")

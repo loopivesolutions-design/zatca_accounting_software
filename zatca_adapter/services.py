@@ -606,7 +606,7 @@ def _build_invoice_xml(document, is_credit_note: bool) -> str:
     return etree.tostring(root, encoding="utf-8", xml_declaration=False).decode("utf-8")
 
 
-def prepare_zatca_artifacts(document, *, is_credit_note: bool = False) -> None:
+def prepare_zatca_artifacts(document, *, is_credit_note: bool = False, force_sign: bool = False) -> None:
     company = CompanySettings.objects.first()
     now_ts = timezone.now()
     timestamp = now_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -653,6 +653,29 @@ def prepare_zatca_artifacts(document, *, is_credit_note: bool = False) -> None:
                 for e in preflight.get("errors", [])
             ]
         )
+
+    # ── Signing gate ────────────────────────────────────────────────────────
+    # When ZATCA_SIGNING_ENABLED is False (the default), invoice posting stores
+    # the unsigned artifacts and returns.  Actual signing + submission only
+    # happens when the user clicks "Report to Fatoora" (a separate API call).
+    try:
+        from django.conf import settings as _dj_settings
+        _signing_enabled = bool(getattr(_dj_settings, "ZATCA_SIGNING_ENABLED", False))
+    except Exception:
+        _signing_enabled = False
+
+    if not _signing_enabled and not force_sign:
+        document.zatca_xml = unsigned_xml
+        document.zatca_canonical_xml = canonical_xml
+        document.zatca_invoice_hash = invoice_hash
+        document.zatca_signed_hash = ""
+        document.zatca_signature_value = ""
+        document.zatca_signed_xml = ""
+        document.zatca_certificate = None
+        document.zatca_submission_status = "not_submitted"
+        document.zatca_submission_error = ""
+        return
+    # ────────────────────────────────────────────────────────────────────────
 
     cert = _get_active_certificate()
     if not (cert.certificate_pem or "").strip():

@@ -390,11 +390,11 @@ class InvoiceDetailAPI(APIView):
             invoice = Invoice.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
             if not invoice:
                 return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Invoice not found.", http_status=404)  # type: ignore[arg-type]
-            if invoice.status == "posted":
+            if invoice.status in ("confirmed", "posted", "reported"):
                 return finalize_idempotent_failure(
                     rec,  # type: ignore[arg-type]
-                    error="INVOICE_POSTED",
-                    message="Posted invoice cannot be deleted.",
+                    error="INVOICE_LOCKED",
+                    message="Invoice cannot be deleted after it has been confirmed.",
                     http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 )
             invoice.is_deleted = True
@@ -407,6 +407,10 @@ class InvoiceDetailAPI(APIView):
 class InvoicePostAPI(APIView):
     """
     POST /sales/invoices/<uuid>/post/
+
+    Confirms (locks) the invoice.  No journal entry and no XML are created here.
+    Journal creation + ZATCA XML happen when the user clicks "Report to Fatoora"
+    (POST /sales/invoices/<uuid>/zatca/submit/).
     """
 
     permission_classes = [IsAuthenticated, CanPostSales]
@@ -416,7 +420,6 @@ class InvoicePostAPI(APIView):
         if early:
             return early
 
-        # Validate request payload early, but lock & re-check inside the DB transaction.
         serializer = InvoicePostSerializer(data=request.data, context={"invoice_id": str(pk)})
         serializer.is_valid(raise_exception=True)
         try:
@@ -430,7 +433,7 @@ class InvoicePostAPI(APIView):
                         http_status=404,
                     )
 
-                if invoice.status == "posted":
+                if invoice.status in ("confirmed", "posted", "reported"):
                     response = Response(InvoiceSerializer(invoice).data, status=status.HTTP_200_OK)
                     finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                     return response
@@ -450,33 +453,11 @@ class InvoicePostAPI(APIView):
                     finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                     return response
 
-                je = post_invoice_journal(invoice=invoice, user=request.user)
-                invoice.journal_entry = je
-                invoice.status = "posted"
+                # Lock the invoice — no journal, no XML at this stage.
+                invoice.status = "confirmed"
                 invoice.posted_at = timezone.now()
-                prepare_zatca_artifacts(invoice, is_credit_note=False)
                 invoice.updator = request.user
-                invoice.save(
-                    update_fields=[
-                        "status",
-                        "posted_at",
-                        "qr_code_text",
-                        "zatca_uuid",
-                        "zatca_previous_hash",
-                        "zatca_invoice_hash",
-                        "zatca_signed_hash",
-                        "zatca_xml",
-                        "zatca_canonical_xml",
-                        "zatca_signature_value",
-                        "zatca_signed_xml",
-                        "zatca_certificate",
-                        "zatca_submission_status",
-                        "zatca_submission_error",
-                        "updator",
-                        "journal_entry",
-                        "updated_at",
-                    ]
-                )
+                invoice.save(update_fields=["status", "posted_at", "updator", "updated_at"])
         except ValueError as exc:
             return finalize_idempotent_failure(
                 rec,  # type: ignore[arg-type]
@@ -718,7 +699,7 @@ class CustomerOutstandingInvoicesAPI(APIView):
 
         invoices = Invoice.objects.filter(
             is_deleted=False,
-            status__in=["posted", "partially_paid", "overdue"],
+            status__in=["posted", "reported", "partially_paid", "overdue"],
             customer_id=customer_id,
         ).order_by("date", "created_at")
 
@@ -960,7 +941,7 @@ class CustomerOutstandingCreditNotesAPI(APIView):
 
         credit_notes = CustomerCreditNote.objects.filter(
             is_deleted=False,
-            status="posted",
+            status__in=["posted", "reported"],
             customer_id=customer_id,
         ).order_by("date", "created_at")
 
@@ -1095,6 +1076,10 @@ class CustomerCreditNoteDetailAPI(APIView):
 class CustomerCreditNotePostAPI(APIView):
     """
     POST /sales/credit-notes/<uuid>/post/
+
+    Confirms (locks) the credit note.  No journal entry and no XML are created here.
+    Journal creation + ZATCA XML happen when the user clicks "Report to Fatoora"
+    (POST /sales/credit-notes/<uuid>/zatca/submit/).
     """
 
     permission_classes = [IsAuthenticated, CanViewZatca]
@@ -1113,7 +1098,7 @@ class CustomerCreditNotePostAPI(APIView):
                     return finalize_idempotent_failure(  # type: ignore[arg-type]
                         rec, error="NOT_FOUND", message="Credit note not found.", http_status=404
                     )
-                if note.status == "posted":
+                if note.status in ("confirmed", "posted", "reported"):
                     response = Response(CustomerCreditNoteSerializer(note).data, status=status.HTTP_200_OK)
                     finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                     return response
@@ -1133,33 +1118,11 @@ class CustomerCreditNotePostAPI(APIView):
                     finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                     return response
 
-                je = post_credit_note_journal(note=note, user=request.user)
-                note.journal_entry = je
-                note.status = "posted"
+                # Lock the credit note — no journal, no XML at this stage.
+                note.status = "confirmed"
                 note.posted_at = timezone.now()
-                prepare_zatca_artifacts(note, is_credit_note=True)
                 note.updator = request.user
-                note.save(
-                    update_fields=[
-                        "status",
-                        "posted_at",
-                        "qr_code_text",
-                        "zatca_uuid",
-                        "zatca_previous_hash",
-                        "zatca_invoice_hash",
-                        "zatca_signed_hash",
-                        "zatca_xml",
-                        "zatca_canonical_xml",
-                        "zatca_signature_value",
-                        "zatca_signed_xml",
-                        "zatca_certificate",
-                        "zatca_submission_status",
-                        "zatca_submission_error",
-                        "updator",
-                        "journal_entry",
-                        "updated_at",
-                    ]
-                )
+                note.save(update_fields=["status", "posted_at", "updator", "updated_at"])
         except ValueError as exc:
             return finalize_idempotent_failure(
                 rec,  # type: ignore[arg-type]
@@ -1191,11 +1154,11 @@ class InvoiceZatcaSubmitAPI(APIView):
             invoice = Invoice.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
             if not invoice:
                 return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Invoice not found.", http_status=404)  # type: ignore[arg-type]
-            if invoice.status != "posted":
+            if invoice.status not in ("confirmed", "posted", "reported"):
                 return finalize_idempotent_failure(
                     rec,  # type: ignore[arg-type]
-                    error="NOT_POSTED",
-                    message="Only posted invoices can be submitted to ZATCA.",
+                    error="NOT_CONFIRMED",
+                    message="Invoice must be confirmed before reporting to Fatoora.",
                     http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 )
             if AccountingPeriod.is_date_closed(invoice.date):
@@ -1230,6 +1193,36 @@ class InvoiceZatcaSubmitAPI(APIView):
                 finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                 return response
 
+            # Sign the invoice now if it hasn't been signed yet (e.g. ZATCA_SIGNING_ENABLED=False
+            # was set during posting, so signing was deferred until this "Report to Fatoora" call).
+            if not (invoice.zatca_signed_xml or "").strip():
+                try:
+                    prepare_zatca_artifacts(invoice, is_credit_note=False, force_sign=True)
+                    invoice.save(
+                        update_fields=[
+                            "qr_code_text",
+                            "zatca_uuid",
+                            "zatca_previous_hash",
+                            "zatca_invoice_hash",
+                            "zatca_signed_hash",
+                            "zatca_xml",
+                            "zatca_canonical_xml",
+                            "zatca_signature_value",
+                            "zatca_signed_xml",
+                            "zatca_certificate",
+                            "zatca_submission_status",
+                            "zatca_submission_error",
+                            "updated_at",
+                        ]
+                    )
+                except Exception as exc:
+                    return finalize_idempotent_failure(
+                        rec,  # type: ignore[arg-type]
+                        error="POST_VALIDATION_ERROR",
+                        message=str(exc),
+                        http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+
             log = ZatcaSubmissionLog.objects.create(
                 document_type="invoice",
                 document_id=invoice.id,
@@ -1249,8 +1242,25 @@ class InvoiceZatcaSubmitAPI(APIView):
             user=request.user,
             log=log,
         )
+        # On success (sync simulation path) or when queued (async outbox path):
+        # create the journal entry and mark invoice as "reported".
+        if status_code in (status.HTTP_200_OK, status.HTTP_202_ACCEPTED):
+            if invoice.status not in ("reported", "posted"):
+                try:
+                    with transaction.atomic():
+                        invoice_fresh = Invoice.objects.select_for_update().filter(pk=invoice.pk, is_deleted=False).first()
+                        if invoice_fresh and invoice_fresh.status not in ("reported", "posted"):
+                            je = post_invoice_journal(invoice=invoice_fresh, user=request.user)
+                            invoice_fresh.journal_entry = je
+                            invoice_fresh.status = "reported"
+                            invoice_fresh.updator = request.user
+                            invoice_fresh.save(update_fields=["status", "journal_entry", "updator", "updated_at"])
+                            invoice = invoice_fresh
+                except Exception:
+                    pass  # journal creation failure is non-fatal here; document was already submitted
+
         response = Response(body, status=status_code)
-        if status_code == status.HTTP_200_OK:
+        if status_code in (status.HTTP_200_OK, status.HTTP_202_ACCEPTED):
             finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
         return response
 
@@ -1274,11 +1284,11 @@ class CreditNoteZatcaSubmitAPI(APIView):
             note = CustomerCreditNote.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
             if not note:
                 return finalize_idempotent_failure(rec, error="NOT_FOUND", message="Credit note not found.", http_status=404)  # type: ignore[arg-type]
-            if note.status != "posted":
+            if note.status not in ("confirmed", "posted", "reported"):
                 return finalize_idempotent_failure(
                     rec,  # type: ignore[arg-type]
-                    error="NOT_POSTED",
-                    message="Only posted credit notes can be submitted to ZATCA.",
+                    error="NOT_CONFIRMED",
+                    message="Credit note must be confirmed before reporting to Fatoora.",
                     http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 )
             if AccountingPeriod.is_date_closed(note.date):
@@ -1313,6 +1323,35 @@ class CreditNoteZatcaSubmitAPI(APIView):
                 finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
                 return response
 
+            # Sign the credit note now if it hasn't been signed yet (deferred signing path).
+            if not (note.zatca_signed_xml or "").strip():
+                try:
+                    prepare_zatca_artifacts(note, is_credit_note=True, force_sign=True)
+                    note.save(
+                        update_fields=[
+                            "qr_code_text",
+                            "zatca_uuid",
+                            "zatca_previous_hash",
+                            "zatca_invoice_hash",
+                            "zatca_signed_hash",
+                            "zatca_xml",
+                            "zatca_canonical_xml",
+                            "zatca_signature_value",
+                            "zatca_signed_xml",
+                            "zatca_certificate",
+                            "zatca_submission_status",
+                            "zatca_submission_error",
+                            "updated_at",
+                        ]
+                    )
+                except Exception as exc:
+                    return finalize_idempotent_failure(
+                        rec,  # type: ignore[arg-type]
+                        error="POST_VALIDATION_ERROR",
+                        message=str(exc),
+                        http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+
             log = ZatcaSubmissionLog.objects.create(
                 document_type="credit_note",
                 document_id=note.id,
@@ -1332,8 +1371,22 @@ class CreditNoteZatcaSubmitAPI(APIView):
             user=request.user,
             log=log,
         )
+        if status_code in (status.HTTP_200_OK, status.HTTP_202_ACCEPTED):
+            if note.status not in ("reported", "posted"):
+                try:
+                    with transaction.atomic():
+                        note_fresh = CustomerCreditNote.objects.select_for_update().filter(pk=note.pk, is_deleted=False).first()
+                        if note_fresh and note_fresh.status not in ("reported", "posted"):
+                            je = post_credit_note_journal(note=note_fresh, user=request.user)
+                            note_fresh.journal_entry = je
+                            note_fresh.status = "reported"
+                            note_fresh.updator = request.user
+                            note_fresh.save(update_fields=["status", "journal_entry", "updator", "updated_at"])
+                except Exception:
+                    pass
+
         response = Response(body, status=status_code)
-        if status_code == status.HTTP_200_OK:
+        if status_code in (status.HTTP_200_OK, status.HTTP_202_ACCEPTED):
             finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
         return response
 
