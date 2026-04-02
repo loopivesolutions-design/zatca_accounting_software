@@ -411,7 +411,10 @@ class InvoicePostSerializer(serializers.Serializer):
     qr_code_text = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
-        invoice: Invoice = self.context["invoice"]
+        invoice_id = self.context.get("invoice_id")
+        invoice = Invoice.objects.filter(pk=invoice_id, is_deleted=False).first() if invoice_id else None
+        if not invoice:
+            raise serializers.ValidationError({"error": "NOT_FOUND", "message": "Invoice not found."})
         if invoice.status == "posted":
             raise serializers.ValidationError(
                 {"error": "INVOICE_ALREADY_POSTED", "message": "Invoice already posted."}
