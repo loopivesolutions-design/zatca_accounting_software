@@ -82,6 +82,64 @@ def post_bill_journal(*, bill, user, payable_account_id=None, vat_account_id=Non
     return je
 
 
+def post_debit_note_journal(*, debit_note, user, posting_date=None, memo=""):
+    """Post a debit note (purchase return): DR Accounts Payable / CR Expense & VAT Input."""
+    _assert_open_period(posting_date or debit_note.date)
+    ap_account = get_system_account("ACCOUNTS_PAYABLE", fallback_code="211")
+    vat_account = get_system_account("VAT_INPUT", fallback_code="116")
+
+    je = JournalEntry.objects.create(
+        date=posting_date or debit_note.date,
+        description=memo or f"Debit Note {debit_note.debit_note_number}",
+        status="draft",
+        creator=user,
+    )
+
+    order = 0
+    tax_total = Decimal("0")
+
+    for line in debit_note.lines.filter(is_deleted=False).select_related("account", "tax_rate"):
+        base_amount = line.subtotal()
+        if base_amount > 0:
+            JournalEntryLine.objects.create(
+                journal_entry=je,
+                account=line.account,
+                description=f"Debit Note {debit_note.debit_note_number} - {line.description}",
+                debit=Decimal("0"),
+                credit=base_amount,
+                line_order=order,
+                creator=user,
+            )
+            order += 1
+        tax_total += line.tax_amount()
+
+    if tax_total > 0:
+        if not vat_account:
+            raise ValueError("VAT Input account (code 116) required for taxable debit note lines.")
+        JournalEntryLine.objects.create(
+            journal_entry=je,
+            account=vat_account,
+            description=f"VAT on Debit Note {debit_note.debit_note_number}",
+            debit=Decimal("0"),
+            credit=tax_total,
+            line_order=order,
+            creator=user,
+        )
+        order += 1
+
+    JournalEntryLine.objects.create(
+        journal_entry=je,
+        account=ap_account,
+        description=f"Accounts Payable - Debit Note {debit_note.debit_note_number}",
+        debit=debit_note.total_amount,
+        credit=Decimal("0"),
+        line_order=order,
+        creator=user,
+    )
+    _post_journal(je)
+    return je
+
+
 def post_invoice_journal(*, invoice, user):
     from sales.zatca_chain_health import assert_zatca_hash_chain_allows_new_sales_posting
 

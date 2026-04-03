@@ -17,7 +17,7 @@ from accounting.models import JournalEntry, JournalEntryLine, Account
 from main.management.commands.create_groups_and_permissions import IsAdmin
 from main.idempotency import begin_idempotent, finalize_idempotent_failure, finalize_idempotent_success
 from accounting.permissions import CanPostPurchases
-from accounting.services.posting import post_bill_journal, post_supplier_payment_journal
+from accounting.services.posting import post_bill_journal, post_debit_note_journal, post_supplier_payment_journal
 from purchases.supplier_payment_posting import apply_supplier_payment_allocations, sync_bill_payment_status
 from purchases.supplier_refund_posting import (
     apply_supplier_refund_allocations,
@@ -649,6 +649,48 @@ class DebitNoteDetailAPI(APIView):
         note.is_deleted = True
         note.save(update_fields=["is_deleted", "updated_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DebitNotePostAPI(APIView):
+    """
+    POST /purchases/debit-notes/<uuid>/post/
+    Transitions a draft debit note to posted and creates its journal entry.
+    """
+
+    permission_classes = [IsAuthenticated, CanPostPurchases]
+
+    def post(self, request, pk):
+        rec, early = begin_idempotent(request, scope="purchases.debit_note.post")
+        if early:
+            return early
+
+        with transaction.atomic():
+            note = DebitNote.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+            if not note:
+                return finalize_idempotent_failure(  # type: ignore[arg-type]
+                    rec, error="NOT_FOUND", message="Debit note not found.", http_status=404
+                )
+            if note.status == "posted":
+                response = Response(DebitNoteSerializer(note).data, status=status.HTTP_200_OK)
+                finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+                return response
+
+            try:
+                je = post_debit_note_journal(debit_note=note, user=request.user)
+            except ValueError as exc:
+                return finalize_idempotent_failure(  # type: ignore[arg-type]
+                    rec,
+                    error="POST_VALIDATION_ERROR",
+                    message=str(exc),
+                    http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+
+            note.journal_entry = je
+            note.mark_posted(user=request.user)
+
+        response = Response(DebitNoteSerializer(note).data, status=status.HTTP_200_OK)
+        finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
+        return response
 
 
 # ── Supplier Refunds ──────────────────────────────────────────────────────────
