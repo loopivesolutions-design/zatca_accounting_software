@@ -699,7 +699,7 @@ class CustomerOutstandingInvoicesAPI(APIView):
 
         invoices = Invoice.objects.filter(
             is_deleted=False,
-            status__in=["posted", "reported", "partially_paid", "overdue"],
+            status__in=["confirmed", "posted", "reported", "partially_paid", "overdue"],
             customer_id=customer_id,
         ).order_by("date", "created_at")
 

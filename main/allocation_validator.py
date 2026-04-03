@@ -64,8 +64,8 @@ class AllocationValidator:
 
     @classmethod
     def validate_customer_payment_invoice(cls, invoice, payment) -> None:
-        if invoice.status not in ("posted", "reported"):
-            raise ValueError(f"Invoice {invoice.invoice_number} must be reported to Fatoora before payment.")
+        if invoice.status not in ("confirmed", "posted", "reported"):
+            raise ValueError(f"Invoice {invoice.invoice_number} must be confirmed before payment.")
         if invoice.customer_id != payment.customer_id:
             raise ValueError("Invoice customer must match payment customer.")
         cls._validate_currency_match(invoice, payment, doc_label="Invoice")

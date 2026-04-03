@@ -32,6 +32,23 @@ def _credit_note_refunded_sum_locked(note: CustomerCreditNote) -> Decimal:
     return (total or Decimal("0")).quantize(Decimal("0.01"))
 
 
+_ACTIVE_INVOICE_STATUSES = {"confirmed", "posted", "reported"}
+
+
+def _sync_invoice_payment_status(invoice: Invoice) -> None:
+    """Update invoice status based on its current paid_amount vs total_amount."""
+    paid = (invoice.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+    total = (invoice.total_amount or Decimal("0")).quantize(Decimal("0.01"))
+    if paid >= total and total > 0:
+        invoice.status = "paid"
+    elif paid > 0:
+        invoice.status = "partially_paid"
+    elif invoice.status in ("paid", "partially_paid"):
+        # Rolled back to zero — restore to the nearest active status
+        invoice.status = "reported" if invoice.journal_entry_id else "confirmed"
+    invoice.save(update_fields=["paid_amount", "status", "updated_at"])
+
+
 def rollback_customer_payment_allocations(payment: CustomerPayment) -> None:
     for allocation in payment.allocations.filter(is_deleted=False).select_related("invoice"):
         invoice = Invoice.objects.select_for_update().get(pk=allocation.invoice_id)
@@ -42,7 +59,7 @@ def rollback_customer_payment_allocations(payment: CustomerPayment) -> None:
         invoice.paid_amount = (invoice.paid_amount or Decimal("0")) - allocation.amount
         if invoice.paid_amount < 0:
             invoice.paid_amount = Decimal("0")
-        invoice.save(update_fields=["paid_amount", "updated_at"])
+        _sync_invoice_payment_status(invoice)
     payment.allocations.filter(is_deleted=False).update(is_deleted=True)
 
 
@@ -79,7 +96,7 @@ def apply_customer_payment_allocations(payment: CustomerPayment, allocations, us
             creator=user,
         )
         invoice.paid_amount = (invoice.paid_amount or Decimal("0")) + amount
-        invoice.save(update_fields=["paid_amount", "updated_at"])
+        _sync_invoice_payment_status(invoice)
         total_applied += amount
 
     if total_applied > payment.amount_received:
