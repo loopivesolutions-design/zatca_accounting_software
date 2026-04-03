@@ -148,6 +148,19 @@ def update_customer_payment_from_payload(*, payment_id, payload: dict, user) -> 
     return payment
 
 
+def _sync_credit_note_refund_status(credit_note: CustomerCreditNote) -> None:
+    """Update credit note status based on its current refunded_amount vs total_amount."""
+    refunded = (credit_note.refunded_amount or Decimal("0")).quantize(Decimal("0.01"))
+    total = (credit_note.total_amount or Decimal("0")).quantize(Decimal("0.01"))
+    if refunded >= total and total > 0:
+        credit_note.status = "paid"
+    elif refunded > 0:
+        credit_note.status = "partially_paid"
+    elif credit_note.status in ("paid", "partially_paid"):
+        credit_note.status = "reported" if credit_note.journal_entry_id else "confirmed"
+    credit_note.save(update_fields=["refunded_amount", "status", "updated_at"])
+
+
 def rollback_customer_refund_allocations(refund: CustomerRefund) -> None:
     for allocation in refund.allocations.filter(is_deleted=False).select_related("credit_note"):
         credit_note = CustomerCreditNote.objects.select_for_update().get(pk=allocation.credit_note_id)
@@ -160,7 +173,7 @@ def rollback_customer_refund_allocations(refund: CustomerRefund) -> None:
         credit_note.refunded_amount = (credit_note.refunded_amount or Decimal("0")) - allocation.amount
         if credit_note.refunded_amount < 0:
             credit_note.refunded_amount = Decimal("0")
-        credit_note.save(update_fields=["refunded_amount", "updated_at"])
+        _sync_credit_note_refund_status(credit_note)
     refund.allocations.filter(is_deleted=False).update(is_deleted=True)
 
 
@@ -197,7 +210,7 @@ def apply_customer_refund_allocations(refund: CustomerRefund, allocations, user)
             creator=user,
         )
         credit_note.refunded_amount = (credit_note.refunded_amount or Decimal("0")) + amount
-        credit_note.save(update_fields=["refunded_amount", "updated_at"])
+        _sync_credit_note_refund_status(credit_note)
         total_applied += amount
 
     if total_applied > refund.amount_refunded:

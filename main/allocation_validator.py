@@ -74,8 +74,8 @@ class AllocationValidator:
 
     @classmethod
     def validate_customer_refund_credit_note(cls, credit_note, refund) -> None:
-        if credit_note.status not in ("posted", "reported"):
-            raise ValueError(f"Credit note {credit_note.credit_note_number} must be reported to Fatoora before refund.")
+        if credit_note.status not in ("confirmed", "posted", "reported"):
+            raise ValueError(f"Credit note {credit_note.credit_note_number} must be confirmed before refund.")
         if credit_note.customer_id != refund.customer_id:
             raise ValueError("Credit note customer must match refund customer.")
         cls._validate_currency_match(credit_note, refund, doc_label="Credit note")

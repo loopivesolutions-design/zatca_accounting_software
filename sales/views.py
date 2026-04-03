@@ -941,7 +941,7 @@ class CustomerOutstandingCreditNotesAPI(APIView):
 
         credit_notes = CustomerCreditNote.objects.filter(
             is_deleted=False,
-            status__in=["posted", "reported"],
+            status__in=["confirmed", "posted", "reported"],
             customer_id=customer_id,
         ).order_by("date", "created_at")
 
