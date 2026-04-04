@@ -340,6 +340,26 @@ class BillPostAPI(APIView):
         finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
         return response
 
+class SupplierPaymentChoicesAPI(APIView):
+    """
+    GET /purchases/supplier-payments/choices/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import re as _re
+        last = SupplierPayment.objects.order_by("-created_at").values_list("payment_number", flat=True).first()
+        next_number = "SP-0001"
+        if last:
+            m = _re.search(r"(\d+)$", last)
+            if m:
+                next_number = last[: last.rfind(m.group(1))] + str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+            else:
+                next_number = last + "-1"
+        return Response({"next_number": next_number})
+
+
 class SupplierPaymentPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
@@ -694,6 +714,26 @@ class DebitNotePostAPI(APIView):
 
 
 # ── Supplier Refunds ──────────────────────────────────────────────────────────
+
+class SupplierRefundChoicesAPI(APIView):
+    """
+    GET /purchases/supplier-refunds/choices/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import re as _re
+        last = SupplierRefund.objects.order_by("-created_at").values_list("refund_number", flat=True).first()
+        next_number = "SRF-0001"
+        if last:
+            m = _re.search(r"(\d+)$", last)
+            if m:
+                next_number = last[: last.rfind(m.group(1))] + str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+            else:
+                next_number = last + "-1"
+        return Response({"next_number": next_number})
+
 
 class SupplierRefundPagination(PageNumberPagination):
     page_size = 20
