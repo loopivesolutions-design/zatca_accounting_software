@@ -286,9 +286,19 @@ class QuoteChoicesAPI(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        last = Quote.objects.order_by("-created_at").values_list("quote_number", flat=True).first()
+        next_number = "QT-0001"
+        if last:
+            import re
+            m = re.search(r"(\d+)$", last)
+            if m:
+                next_number = last[: last.rfind(m.group(1))] + str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+            else:
+                next_number = last + "-1"
         return Response(
             {
                 "status": [{"id": k, "label": v} for k, v in QUOTE_STATUS_CHOICES],
+                "next_number": next_number,
             }
         )
 
