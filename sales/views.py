@@ -488,7 +488,16 @@ class InvoiceChoicesAPI(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        return Response({"status": [{"id": k, "label": v} for k, v in INVOICE_STATUS_CHOICES]})
+        import re as _re
+        last = Invoice.objects.order_by("-created_at").values_list("invoice_number", flat=True).first()
+        next_number = "INV-0001"
+        if last:
+            m = _re.search(r"(\d+)$", last)
+            if m:
+                next_number = last[: last.rfind(m.group(1))] + str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+            else:
+                next_number = last + "-1"
+        return Response({"status": [{"id": k, "label": v} for k, v in INVOICE_STATUS_CHOICES], "next_number": next_number})
 
 
 class CustomerPaymentPagination(PageNumberPagination):
