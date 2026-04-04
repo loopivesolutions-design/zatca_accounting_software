@@ -982,6 +982,26 @@ class CustomerOutstandingCreditNotesAPI(APIView):
         return Response({"results": results})
 
 
+class CustomerCreditNoteChoicesAPI(APIView):
+    """
+    GET /sales/credit-notes/choices/
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import re as _re
+        last = CustomerCreditNote.objects.order_by("-created_at").values_list("credit_note_number", flat=True).first()
+        next_number = "CN-0001"
+        if last:
+            m = _re.search(r"(\d+)$", last)
+            if m:
+                next_number = last[: last.rfind(m.group(1))] + str(int(m.group(1)) + 1).zfill(len(m.group(1)))
+            else:
+                next_number = last + "-1"
+        return Response({"next_number": next_number})
+
+
 class CustomerCreditNotePagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
