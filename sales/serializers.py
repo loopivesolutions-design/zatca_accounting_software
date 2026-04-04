@@ -29,6 +29,8 @@ class CustomerSerializer(serializers.ModelSerializer):
     opening_balance_type_display = serializers.SerializerMethodField()
     opening_balance_account_name = serializers.CharField(source="opening_balance_account.name", read_only=True)
     opening_balance_account_code = serializers.CharField(source="opening_balance_account.code", read_only=True)
+    # Allow null so the frontend can explicitly clear TRN for non-registered customers
+    tax_registration_number = serializers.CharField(allow_null=True, allow_blank=True, required=False, default="")
 
     class Meta:
         model = Customer
@@ -78,26 +80,32 @@ class CustomerSerializer(serializers.ModelSerializer):
         return dict(CUSTOMER_OPENING_BALANCE_CHOICES).get(obj.opening_balance_type, obj.opening_balance_type)
 
     def validate_tax_registration_number(self, value):
-        import re
-        if not value:
-            return value
-        if not re.fullmatch(r'3\d{13}3', value):
-            raise serializers.ValidationError(
-                "Tax Registration Number must be exactly 15 digits, starting and ending with 3."
-            )
-        return value
+        # Coerce None → "" so CharField model field is never given null
+        return value if value is not None else ""
 
     def validate(self, attrs):
+        import re
+        # Coerce null TRN to empty string
+        if attrs.get("tax_registration_number") is None:
+            attrs["tax_registration_number"] = ""
+
         vat_treatment = attrs.get("vat_treatment")
         if vat_treatment is None and self.instance is not None:
             vat_treatment = self.instance.vat_treatment
-        trn = attrs.get("tax_registration_number")
-        if trn is None and self.instance is not None:
-            trn = self.instance.tax_registration_number
-        if vat_treatment == "vat_registered_ksa" and not trn:
-            raise serializers.ValidationError(
-                {"tax_registration_number": "Tax Registration Number is required for VAT-registered customers."}
-            )
+
+        if vat_treatment == "not_vat_registered_ksa":
+            attrs["tax_registration_number"] = ""
+        elif vat_treatment == "vat_registered_ksa":
+            trn = attrs.get("tax_registration_number", "").strip()
+            if not trn:
+                raise serializers.ValidationError(
+                    {"tax_registration_number": "Tax Registration Number is required for VAT-registered customers."}
+                )
+            if not re.fullmatch(r'3\d{13}3', trn):
+                raise serializers.ValidationError(
+                    {"tax_registration_number": "Tax Registration Number must be exactly 15 digits, starting and ending with 3."}
+                )
+            attrs["tax_registration_number"] = trn
 
         opening_type = attrs.get("opening_balance_type")
         if opening_type is None and self.instance is not None:

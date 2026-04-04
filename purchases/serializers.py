@@ -28,6 +28,8 @@ class SupplierSerializer(serializers.ModelSerializer):
     opening_balance_type_display = serializers.SerializerMethodField()
     opening_balance_account_name = serializers.CharField(source="opening_balance_account.name", read_only=True)
     opening_balance_account_code = serializers.CharField(source="opening_balance_account.code", read_only=True)
+    # Allow null so the frontend can explicitly clear TRN for non-registered suppliers
+    tax_registration_number = serializers.CharField(allow_null=True, allow_blank=True, required=False, default="")
 
     class Meta:
         model = Supplier
@@ -81,7 +83,34 @@ class SupplierSerializer(serializers.ModelSerializer):
         Opening balance rules (matches UI behavior):
         - If opening_balance_type == 'none': ignore amount/date/account (set to 0/null)
         - Otherwise: require amount > 0 and as_of date
+
+        TRN rules:
+        - 'not_vat_registered_ksa': TRN must be blank (null/empty → coerced to "")
+        - 'vat_registered_ksa' / 'outside_ksa': TRN required and must be a valid 15-digit number
         """
+        # Coerce null TRN to empty string (model field is CharField, not nullable)
+        if attrs.get("tax_registration_number") is None:
+            attrs["tax_registration_number"] = ""
+
+        vat_treatment = attrs.get("vat_treatment")
+        if vat_treatment is None and self.instance is not None:
+            vat_treatment = self.instance.vat_treatment
+
+        if vat_treatment == "not_vat_registered_ksa":
+            attrs["tax_registration_number"] = ""
+        elif vat_treatment in ("vat_registered_ksa", "outside_ksa"):
+            trn = attrs.get("tax_registration_number", "").strip()
+            if not trn:
+                raise serializers.ValidationError(
+                    {"tax_registration_number": "Tax registration number is required for this VAT treatment."}
+                )
+            digits = "".join(c for c in trn if c.isdigit())
+            if len(digits) != 15 or not (digits.startswith("3") and digits.endswith("3")):
+                raise serializers.ValidationError(
+                    {"tax_registration_number": "Tax registration number must be exactly 15 digits and start and end with 3."}
+                )
+            attrs["tax_registration_number"] = digits
+
         opening_type = attrs.get("opening_balance_type")
         # During PATCH, fall back to existing value if not provided
         if opening_type is None and self.instance is not None:
