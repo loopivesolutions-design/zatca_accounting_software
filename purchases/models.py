@@ -229,6 +229,14 @@ class BillLine(BaseModel):
         related_name="lines",
         verbose_name=_("Bill"),
     )
+    product = models.ForeignKey(
+        "products.Product",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bill_lines",
+        verbose_name=_("Product"),
+    )
     description = models.CharField(_("Description"), max_length=500)
     account = models.ForeignKey(
         "accounting.Account",

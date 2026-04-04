@@ -335,10 +335,37 @@ class BillPostAPI(APIView):
                 )
 
             bill.mark_posted(user=request.user)
+            _update_stock_from_bill(bill, user=request.user)
 
         response = Response(BillSerializer(bill).data, status=status.HTTP_200_OK)
         finalize_idempotent_success(rec, response)  # type: ignore[arg-type]
         return response
+
+
+def _update_stock_from_bill(bill, *, user) -> None:
+    """
+    Increase stock_quantity and recalculate avg_unit_cost (weighted average)
+    for every bill line that references a product.
+    Must be called inside the same transaction.atomic() block as mark_posted().
+    """
+    from decimal import Decimal
+    from products.models import Product
+
+    for line in bill.lines.filter(is_deleted=False).select_related("product"):
+        if not line.product_id:
+            continue
+        product = Product.objects.select_for_update().get(pk=line.product_id)
+        qty = (line.quantity or Decimal("0"))
+        cost = line.subtotal()
+        old_qty = Decimal(product.stock_quantity or 0)
+        old_cost = Decimal(product.avg_unit_cost or 0) or Decimal(product.purchase_price or 0)
+        new_qty = old_qty + qty
+        if qty > 0 and cost > 0 and new_qty > 0:
+            new_avg = ((old_qty * old_cost) + cost) / new_qty
+            product.avg_unit_cost = new_avg.quantize(Decimal("0.01"))
+        product.stock_quantity = new_qty
+        product.save(update_fields=["stock_quantity", "avg_unit_cost", "updated_at"])
+
 
 class SupplierPaymentChoicesAPI(APIView):
     """

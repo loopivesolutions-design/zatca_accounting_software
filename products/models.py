@@ -284,6 +284,7 @@ class InventoryAdjustment(BaseModel):
         _("Adjustment ID"),
         max_length=20,
         unique=True,
+        null=True,
         blank=True,
         db_index=True,
         help_text="Auto-generated sequential ID (e.g. ADJ-000001). Assigned on posting.",
@@ -323,15 +324,21 @@ class InventoryAdjustment(BaseModel):
 
     @classmethod
     def _next_adjustment_id(cls) -> str:
-        with transaction.atomic():
-            cls.objects.select_for_update().filter(adjustment_id__startswith="ADJ-").exists()
-            from django.db.models import Max
-
-            result = cls.objects.aggregate(max_id=Max("adjustment_id"))
-            max_id = result.get("max_id") or "ADJ-000000"
-            match = re.search(r"ADJ-(\d+)$", max_id)
-            num = int(match.group(1)) + 1 if match else 1
-            return f"ADJ-{num:06d}"
+        # Lock all posted rows to prevent duplicate IDs under concurrent requests.
+        last = (
+            cls.objects
+            .select_for_update()
+            .filter(adjustment_id__startswith="ADJ-")
+            .order_by("adjustment_id")
+            .values_list("adjustment_id", flat=True)
+            .last()
+        )
+        num = 1
+        if last:
+            match = re.search(r"ADJ-(\d+)$", last)
+            if match:
+                num = int(match.group(1)) + 1
+        return f"ADJ-{num:06d}"
 
     def total_adjustment_amount(self) -> Decimal:
         total = (

@@ -158,6 +158,7 @@ class BillLineSerializer(serializers.ModelSerializer):
     account_name = serializers.CharField(source="account.name", read_only=True)
     tax_rate_name = serializers.CharField(source="tax_rate.name", read_only=True)
     tax_rate_percent = serializers.DecimalField(source="tax_rate.rate", max_digits=5, decimal_places=2, read_only=True)
+    product_name = serializers.CharField(source="product.name", read_only=True)
     line_subtotal = serializers.SerializerMethodField()
     line_tax_amount = serializers.SerializerMethodField()
     line_total = serializers.SerializerMethodField()
@@ -166,6 +167,8 @@ class BillLineSerializer(serializers.ModelSerializer):
         model = BillLine
         fields = [
             "id",
+            "product",
+            "product_name",
             "description",
             "account",
             "account_code",
