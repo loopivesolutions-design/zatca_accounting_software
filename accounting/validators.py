@@ -98,7 +98,7 @@ TRANSACTION_SOURCES: list[dict] = [
         "app_label": "purchases",
         "model_name": "DebitNoteLine",
         "account_field": "account_id",
-        "filters": {"debit_note__status": "posted", "is_deleted": False},
+        "filters": {"debit_note__status__in": ["posted", "partially_paid", "paid"], "is_deleted": False},
     },
     {
         "app_label": "sales",

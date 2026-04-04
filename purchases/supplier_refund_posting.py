@@ -9,10 +9,18 @@ from .models import DebitNote, SupplierRefund, SupplierRefundAllocation
 
 
 def sync_debit_note_refund_status(debit_note: DebitNote) -> None:
-    """Recompute debit_note.refunded_amount from live allocations."""
+    """Recompute debit_note.refunded_amount and status from live allocations."""
     total = debit_note.refund_allocations.filter(is_deleted=False).aggregate(total=Sum("amount")).get("total")
     debit_note.refunded_amount = (total or Decimal("0")).quantize(Decimal("0.01"))
-    debit_note.save(update_fields=["refunded_amount", "updated_at"])
+    refunded = debit_note.refunded_amount
+    note_total = (debit_note.total_amount or Decimal("0")).quantize(Decimal("0.01"))
+    if refunded >= note_total and note_total > 0:
+        debit_note.status = "paid"
+    elif refunded > 0:
+        debit_note.status = "partially_paid"
+    elif debit_note.status in ("paid", "partially_paid"):
+        debit_note.status = "posted"
+    debit_note.save(update_fields=["refunded_amount", "status", "updated_at"])
 
 
 def apply_supplier_refund_allocations(refund: SupplierRefund, allocations, user) -> None:
@@ -32,7 +40,7 @@ def apply_supplier_refund_allocations(refund: SupplierRefund, allocations, user)
         debit_note = DebitNote.objects.select_for_update().filter(pk=debit_note_id, is_deleted=False).first()
         if not debit_note:
             raise ValueError(f"Invalid debit note: {debit_note_id}")
-        if debit_note.status != "posted":
+        if debit_note.status not in ("posted", "partially_paid"):
             raise ValueError(f"Debit note {debit_note.debit_note_number} must be posted before receiving refund.")
         if debit_note.supplier_id != refund.supplier_id:
             raise ValueError("Debit note supplier must match refund supplier.")

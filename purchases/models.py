@@ -123,6 +123,8 @@ SUPPLIER_PAYMENT_TYPE_CHOICES = (
 DEBIT_NOTE_STATUS_CHOICES = (
     ("draft", "Draft"),
     ("posted", "Posted"),
+    ("partially_paid", "Partially Paid"),
+    ("paid", "Paid"),
 )
 
 
@@ -360,7 +362,7 @@ class DebitNote(BaseModel):
     note = models.TextField(_("Note"), blank=True)
     status = models.CharField(
         _("Status"),
-        max_length=10,
+        max_length=15,
         choices=DEBIT_NOTE_STATUS_CHOICES,
         default="draft",
         db_index=True,
